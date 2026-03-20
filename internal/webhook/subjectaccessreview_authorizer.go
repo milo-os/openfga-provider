@@ -228,13 +228,18 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 	// Step 5: Validate permission exists
 	stepStart = time.Now()
 	ctx, validatePermSpan := tracer.Start(ctx, "validate_permission")
-	validatePermErr := o.validatePermission(ctx, attributes)
+	permExists, validatePermErr := o.validatePermissionWithServiceDefaulting(ctx, attributes)
 	validatePermSpan.End()
 	authzStepDuration.WithLabelValues("validate_permission").Observe(time.Since(stepStart).Seconds())
 	if validatePermErr != nil {
 		span.RecordError(validatePermErr)
 		span.SetStatus(codes.Error, validatePermErr.Error())
 		return authorizer.DecisionDeny, "", validatePermErr
+	}
+	if !permExists {
+		permission := o.buildPermissionString(attributes)
+		slog.WarnContext(ctx, "permission not found", slog.Any("attributes", attributes), slog.String("permission", permission))
+		return authorizer.DecisionDeny, "", fmt.Errorf("permission '%s' not registered", permission)
 	}
 
 	// Step 6: Build and execute OpenFGA check request
@@ -414,23 +419,6 @@ func (o *SubjectAccessReviewAuthorizer) validateOrganizationNamespace(ctx contex
 	if requestNamespace != expectedNamespace {
 		return fmt.Errorf("namespace mismatch: request namespace '%s' does not match organization namespace '%s'",
 			requestNamespace, expectedNamespace)
-	}
-
-	return nil
-}
-
-// validatePermission checks if the requested permission is registered
-func (o *SubjectAccessReviewAuthorizer) validatePermission(ctx context.Context, attributes authorizer.Attributes) error {
-	permissionExists, err := o.validatePermissionWithServiceDefaulting(ctx, attributes)
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to validate permission", slog.String("error", err.Error()))
-		return fmt.Errorf("failed to validate permission: %w", err)
-	}
-
-	if !permissionExists {
-		permission := o.buildPermissionString(attributes)
-		slog.WarnContext(ctx, "permission not found", slog.Any("attributes", attributes), slog.String("permission", permission))
-		return fmt.Errorf("permission '%s' not registered", permission)
 	}
 
 	return nil
