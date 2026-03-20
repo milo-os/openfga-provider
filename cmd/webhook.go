@@ -235,6 +235,9 @@ func runWebhookServer(
 
 	entryLog.Info("registering webhooks to the webhook server")
 
+	// Use the manager's cached client so ProtectedResource List calls are served
+	// from the in-memory informer cache instead of making a network round-trip on
+	// every SubjectAccessReview.
 	webhook.RegisterSubjectAccessReviewWebhook(hookServer, webhook.Config{
 		FGAClient:              fgaClient,
 		FGAStoreID:             openfgaStoreID,
