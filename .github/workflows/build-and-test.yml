@@ -37,6 +37,7 @@ jobs:
       packages: write
     uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.13.1
     with:
+      registry-organization: milo-os
       image-name: auth-provider-openfga
     secrets: inherit
 
