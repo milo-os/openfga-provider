@@ -38,7 +38,7 @@ jobs:
     uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.14.0
     with:
       registry-organization: milo-os
-      image-name: auth-provider-openfga
+      image-name: openfga-provider
     secrets: inherit
 
   publish-kustomize-bundles:
