@@ -28,7 +28,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: manager
-        image: ghcr.io/datum-cloud/auth-provider-openfga:latest
+        image: ghcr.io/milo-os/openfga-provider:latest
         imagePullPolicy: IfNotPresent
         args:
           - manager

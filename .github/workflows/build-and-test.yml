@@ -48,10 +48,10 @@ jobs:
       packages: write
     uses: datum-cloud/actions/.github/workflows/publish-kustomize-bundle.yaml@v1.13.1
     with:
-      bundle-name: ghcr.io/datum-cloud/auth-provider-openfga-kustomize
+      bundle-name: ghcr.io/milo-os/openfga-provider-kustomize
       bundle-path: config
       image-overlays: config/base/services/authz-webhook,config/base/services/controller-manager
-      image-name: ghcr.io/datum-cloud/auth-provider-openfga
+      image-name: ghcr.io/milo-os/openfga-provider
       debug: true
     secrets: inherit
 
@@ -75,7 +75,7 @@ jobs:
 
       - name: Prepare local alias tag
         run: |
-          TAG="ghcr.io/datum-cloud/auth-provider-openfga:${{ needs.publish-container-image.outputs.tag }}"
+          TAG="ghcr.io/milo-os/openfga-provider:${{ needs.publish-container-image.outputs.tag }}"
           docker pull "$TAG"
           docker tag "$TAG" auth-provider-openfga:test
 
@@ -85,7 +85,7 @@ jobs:
           cluster_name: auth-provider-openfga         # optional override
           wait_timeout: "300s"                         # optional override
           images: |
-            ghcr.io/datum-cloud/auth-provider-openfga:${{ needs.publish-container-image.outputs.tag }}
+            ghcr.io/milo-os/openfga-provider:${{ needs.publish-container-image.outputs.tag }}
             auth-provider-openfga:test
 
       - name: Install Task
@@ -133,7 +133,7 @@ jobs:
             namespace: flux-system
           spec:
             interval: 30s
-            url: oci://ghcr.io/datum-cloud/auth-provider-openfga-kustomize
+            url: oci://ghcr.io/milo-os/openfga-provider-kustomize
             ref:
               tag: ${OCI_TAG}
           EOF
