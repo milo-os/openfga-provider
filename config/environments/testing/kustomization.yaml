@@ -9,7 +9,7 @@ kind: Kustomization
 
 resources:
   # External CRDs from Milo API
-  - github.com/datum-cloud/milo/config/crd/overlays/core-control-plane
+  - github.com/milo-os/milo/config/crd/overlays/core-control-plane
   # Base application components
   - ../../base
   # Testing-specific certificate issuers (same as dev for now)
@@ -24,6 +24,6 @@ components:
 
 # Testing-specific image configuration
 images:
-  - name: ghcr.io/datum-cloud/auth-provider-openfga
+  - name: ghcr.io/milo-os/openfga-provider
     newName: auth-provider-openfga
     newTag: dev
