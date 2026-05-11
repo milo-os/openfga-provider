@@ -35,7 +35,7 @@ jobs:
       id-token: write
       contents: read
       packages: write
-    uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.13.1
+    uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.14.0
     with:
       registry-organization: milo-os
       image-name: auth-provider-openfga
@@ -47,7 +47,7 @@ jobs:
       id-token: write
       contents: read
       packages: write
-    uses: datum-cloud/actions/.github/workflows/publish-kustomize-bundle.yaml@v1.13.1
+    uses: datum-cloud/actions/.github/workflows/publish-kustomize-bundle.yaml@v1.14.0
     with:
       bundle-name: ghcr.io/milo-os/openfga-provider-kustomize
       bundle-path: config
