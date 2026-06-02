@@ -1,0 +1,13 @@
+# Same role as gateway-viewer.yaml with an additional permission
+# (organizations.update). Applying this mutates the top of the chain and must
+# propagate down to every descendant Role and to the bound PolicyBinding.
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: inheritance-gateway-viewer
+spec:
+  launchStage: Beta
+  includedPermissions:
+    - resourcemanager.miloapis.com/organizations.get
+    - resourcemanager.miloapis.com/organizations.list
+    - resourcemanager.miloapis.com/organizations.update

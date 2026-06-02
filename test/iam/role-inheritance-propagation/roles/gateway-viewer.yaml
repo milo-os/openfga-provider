@@ -1,0 +1,12 @@
+# Top of the inheritance chain (analogous to networking gateway-viewer).
+# Starts with two organization permissions; the test later adds a third
+# (organizations.update) to verify the change propagates to descendants.
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: inheritance-gateway-viewer
+spec:
+  launchStage: Beta
+  includedPermissions:
+    - resourcemanager.miloapis.com/organizations.get
+    - resourcemanager.miloapis.com/organizations.list

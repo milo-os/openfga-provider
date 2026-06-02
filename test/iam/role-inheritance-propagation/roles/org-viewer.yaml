@@ -1,0 +1,12 @@
+# Leaf of the chain (analogous to datum-cloud-viewer) and the role that is
+# actually bound to a subject. Inherits the middle role, which inherits the top
+# role, so a change at the top must reach this role's effective permissions.
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: inheritance-org-viewer
+spec:
+  launchStage: Beta
+  inheritedRoles:
+    - name: inheritance-networking-viewer
+      namespace: ($namespace)

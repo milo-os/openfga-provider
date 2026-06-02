@@ -1,0 +1,11 @@
+# Middle of the chain (analogous to networking.datumapis.com-viewer).
+# Inherit-only: all of its effective permissions come from gateway-viewer.
+apiVersion: iam.miloapis.com/v1alpha1
+kind: Role
+metadata:
+  name: inheritance-networking-viewer
+spec:
+  launchStage: Beta
+  inheritedRoles:
+    - name: inheritance-gateway-viewer
+      namespace: ($namespace)
