@@ -16,10 +16,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -344,6 +346,41 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	return ctrl.Result{}, nil
 }
 
+// enqueueRequestsForInheritedRoleChange is a handler that enqueues reconcile
+// requests for every Role that transitively inherits the changed Role. A Role's
+// effective permissions are computed from its inherited Roles, so when an
+// inherited (ancestor) Role's permissions change, the descendant Roles must be
+// re-reconciled to refresh their Status.EffectivePermissions. The changed Role
+// itself is reconciled via the primary For() watch and is skipped here.
+func (r *RoleReconciler) enqueueRequestsForInheritedRoleChange(ctx context.Context, obj client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+	changedRole, ok := obj.(*iamdatumapiscomv1alpha1.Role)
+	if !ok {
+		log.Error(fmt.Errorf("unexpected object type in Role handler for Roles: %T", obj), "cannot enqueue Roles")
+		return []reconcile.Request{}
+	}
+
+	changedKey := client.ObjectKey{Namespace: changedRole.Namespace, Name: changedRole.Name}
+	dependents, err := rolesDependentOnRole(ctx, r.Client, changedKey)
+	if err != nil {
+		log.Error(err, "failed to compute Roles dependent on changed Role",
+			"roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
+		return []reconcile.Request{}
+	}
+
+	requests := make([]reconcile.Request, 0, len(dependents))
+	for key := range dependents {
+		if key == changedKey {
+			continue // reconciled via the primary For() watch
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: key})
+		log.V(1).Info("Enqueuing Role due to inherited Role change",
+			"roleName", key.Name, "roleNamespace", key.Namespace,
+			"changedRoleName", changedRole.Name, "changedRoleNamespace", changedRole.Namespace)
+	}
+	return requests
+}
+
 // enqueueRequestsForProtectedResourceChange is a handler that enqueues Role reconcile requests
 // when a ProtectedResource changes.
 func (r *RoleReconciler) enqueueRequestsForProtectedResourceChange(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -419,6 +456,16 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.ProtectedResource{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueueRequestsForProtectedResourceChange),
+	)
+
+	// Watch for changes to other Roles and enqueue the Roles that inherit them,
+	// so descendant Roles refresh their effective permissions when an inherited
+	// (ancestor) Role's permissions change. Filtered to spec changes
+	// (generation bumps) to avoid reacting to our own status updates.
+	controllerBuilder.Watches(
+		&iamdatumapiscomv1alpha1.Role{},
+		handler.EnqueueRequestsFromMapFunc(r.enqueueRequestsForInheritedRoleChange),
+		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	return controllerBuilder.Complete(r)
