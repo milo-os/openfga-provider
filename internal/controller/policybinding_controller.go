@@ -760,6 +760,18 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 		"roleName", changedRole.Name,
 		"roleNamespace", changedRole.Namespace)
 
+	// A PolicyBinding's baked permission tuples derive from the effective
+	// permissions of its bound Role, which include permissions inherited
+	// transitively. So a binding must be re-evaluated not only when its bound
+	// Role changes directly, but also when any Role it transitively inherits
+	// changes. Compute the set of bound Roles affected by this change (the
+	// changed Role plus every Role that inherits it).
+	affectedRoles, err := rolesDependentOnRole(ctx, r.Client, client.ObjectKey{Namespace: changedRole.Namespace, Name: changedRole.Name})
+	if err != nil {
+		log.Error(err, "failed to compute Roles dependent on changed Role", "roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
+		return []reconcile.Request{}
+	}
+
 	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
 	if err := r.List(ctx, policyBindings); err != nil {
 		log.Error(err, "failed to list PolicyBindings for Role change", "roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
@@ -768,9 +780,17 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 
 	requests := make([]reconcile.Request, 0)
 	for _, pb := range policyBindings.Items {
-		// A PolicyBinding should be re-evaluated if its RoleRef matches the changed Role. The RoleRef in PolicyBindingSpec
-		// contains Name and Namespace. An empty RoleRef.Namespace typically refers to a cluster-scoped Role.
-		if pb.Spec.RoleRef.Name == changedRole.Name && pb.Spec.RoleRef.Namespace == changedRole.Namespace {
+		// Resolve the bound Role. An empty RoleRef.Namespace defaults to the
+		// PolicyBinding's namespace.
+		roleNamespace := pb.Spec.RoleRef.Namespace
+		if roleNamespace == "" {
+			roleNamespace = pb.Namespace
+		}
+		boundRole := client.ObjectKey{Namespace: roleNamespace, Name: pb.Spec.RoleRef.Name}
+
+		// Re-evaluate the binding if its bound Role is the changed Role or
+		// transitively inherits it.
+		if _, ok := affectedRoles[boundRole]; ok {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      pb.Name,
@@ -779,6 +799,7 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 			})
 			log.V(1).Info("Enqueuing PolicyBinding due to relevant Role change",
 				"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace,
+				"boundRoleName", boundRole.Name, "boundRoleNamespace", boundRole.Namespace,
 				"changedRoleName", changedRole.Name, "changedRoleNamespace", changedRole.Namespace)
 		}
 	}

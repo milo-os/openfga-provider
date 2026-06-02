@@ -1,0 +1,6 @@
+apiVersion: iam.miloapis.com/v1alpha1
+kind: User
+metadata:
+  name: inheritance-viewer-user
+spec:
+  email: inheritance-viewer-user@datum.net
