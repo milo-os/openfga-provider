@@ -80,15 +80,38 @@ type RoleReconciler struct {
 	EventRecorder record.EventRecorder
 }
 
-// getAllEffectivePermissions collects all unique permissions for a role, including inherited ones.
-func (r *RoleReconciler) getAllEffectivePermissions(ctx context.Context, role *iamdatumapiscomv1alpha1.Role, visited map[string]struct{}) ([]string, error) {
+// unresolvedInheritedRole identifies an inheritedRoles reference that could not
+// be resolved to an existing Role during effective-permission computation.
+type unresolvedInheritedRole struct {
+	Namespace string
+	Name      string
+}
+
+// String renders the reference as "namespace/name" for log, condition, and
+// event messages.
+func (u unresolvedInheritedRole) String() string {
+	return u.Namespace + "/" + u.Name
+}
+
+// getAllEffectivePermissions collects all unique permissions for a role,
+// including those reachable through inheritedRoles.
+//
+// The computation degrades gracefully: a reference to a Role that does not
+// exist yet is recorded in the returned unresolved slice and skipped, rather
+// than failing the whole computation. This keeps a broadly-inherited role
+// (such as a project owner) granting every permission it can resolve while a
+// single dangling reference converges. The function only returns an error for
+// genuine failures (for example, a non-NotFound API error). Callers that want
+// fail-closed behavior must treat a non-empty unresolved slice as a degraded
+// state and surface it.
+func (r *RoleReconciler) getAllEffectivePermissions(ctx context.Context, role *iamdatumapiscomv1alpha1.Role, visited map[string]struct{}) ([]string, []unresolvedInheritedRole, error) {
 	if visited == nil {
 		visited = make(map[string]struct{})
 	}
 
 	roleIdentifier := role.Namespace + "/" + role.Name // Ensure uniqueness for visited roles across namespaces
 	if _, ok := visited[roleIdentifier]; ok {
-		return nil, nil // Prevent cycles
+		return nil, nil, nil // Prevent cycles
 	}
 	visited[roleIdentifier] = struct{}{}
 
@@ -97,6 +120,7 @@ func (r *RoleReconciler) getAllEffectivePermissions(ctx context.Context, role *i
 		permissionSet[p] = struct{}{}
 	}
 
+	var unresolved []unresolvedInheritedRole
 	for _, inheritedRoleRef := range role.Spec.InheritedRoles {
 		inheritedRole := &iamdatumapiscomv1alpha1.Role{}
 
@@ -110,25 +134,145 @@ func (r *RoleReconciler) getAllEffectivePermissions(ctx context.Context, role *i
 		err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: inheritedRoleRef.Name}, inheritedRole)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("inherited role '%s' not found in namespace '%s'", inheritedRoleRef.Name, namespace)
+				// Degrade gracefully: skip the dangling reference (fail-closed
+				// on its permissions) and report it so the caller can surface a
+				// Degraded condition. Do not fail the whole role.
+				unresolved = append(unresolved, unresolvedInheritedRole{Namespace: namespace, Name: inheritedRoleRef.Name})
+				continue
 			}
-			return nil, fmt.Errorf("failed to get inherited role %s/%s: %w", namespace, inheritedRoleRef.Name, err)
+			return nil, nil, fmt.Errorf("failed to get inherited role %s/%s: %w", namespace, inheritedRoleRef.Name, err)
 		}
 
-		inheritedPerms, err := r.getAllEffectivePermissions(ctx, inheritedRole, visited)
+		inheritedPerms, inheritedUnresolved, err := r.getAllEffectivePermissions(ctx, inheritedRole, visited)
 		if err != nil {
-			return nil, err // Propagate error up
+			return nil, nil, err // Propagate genuine errors up
 		}
 		for _, p := range inheritedPerms {
 			permissionSet[p] = struct{}{}
 		}
+		unresolved = append(unresolved, inheritedUnresolved...)
 	}
 
 	finalPermissions := make([]string, 0, len(permissionSet))
 	for p := range permissionSet {
 		finalPermissions = append(finalPermissions, p)
 	}
-	return finalPermissions, nil
+	return finalPermissions, dedupeUnresolved(unresolved), nil
+}
+
+// dedupeUnresolved removes duplicate unresolved references (a diamond-shaped
+// inheritance graph can surface the same dangling reference more than once) and
+// returns them in a deterministic order for stable conditions and events.
+func dedupeUnresolved(refs []unresolvedInheritedRole) []unresolvedInheritedRole {
+	if len(refs) == 0 {
+		return nil
+	}
+	seen := make(map[unresolvedInheritedRole]struct{}, len(refs))
+	deduped := make([]unresolvedInheritedRole, 0, len(refs))
+	for _, ref := range refs {
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		deduped = append(deduped, ref)
+	}
+	sort.Slice(deduped, func(i, j int) bool {
+		if deduped[i].Namespace != deduped[j].Namespace {
+			return deduped[i].Namespace < deduped[j].Namespace
+		}
+		return deduped[i].Name < deduped[j].Name
+	})
+	return deduped
+}
+
+// unresolvedRefStrings renders unresolved references as "namespace/name"
+// strings for structured logging.
+func unresolvedRefStrings(refs []unresolvedInheritedRole) []string {
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, ref.String())
+	}
+	return out
+}
+
+// unresolvedMessage builds a human-readable condition/event message naming the
+// exact unresolved inheritedRoles references.
+func unresolvedMessage(refs []unresolvedInheritedRole) string {
+	return fmt.Sprintf("Role is degraded: permissions from resolvable inherited roles are applied, but %d inheritedRoles reference(s) could not be resolved: %s",
+		len(refs), strings.Join(unresolvedRefStrings(refs), ", "))
+}
+
+// setDegradedCondition records the Degraded condition and a Warning event when
+// the role has unresolved inheritedRoles references, and clears the condition
+// once every reference resolves.
+func (r *RoleReconciler) setDegradedCondition(ctx context.Context, role *iamdatumapiscomv1alpha1.Role, unresolvedRoles []unresolvedInheritedRole, generation int64) {
+	if len(unresolvedRoles) == 0 {
+		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
+			Type:               "Degraded",
+			Status:             metav1.ConditionFalse,
+			Reason:             "AllInheritedRolesResolved",
+			Message:            "All inheritedRoles references resolved.",
+			ObservedGeneration: generation,
+		})
+		return
+	}
+
+	message := unresolvedMessage(unresolvedRoles)
+	meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
+		Type:               "Degraded",
+		Status:             metav1.ConditionTrue,
+		Reason:             "UnresolvedInheritedRoles",
+		Message:            message,
+		ObservedGeneration: generation,
+	})
+	if r.EventRecorder != nil {
+		r.EventRecorder.Event(role, "Warning", "UnresolvedInheritedRoles", message)
+	}
+}
+
+// enqueueRequestsForInheritedRoleChange enqueues every Role that inherits the
+// changed Role. When a previously-missing inherited role is created, its
+// dependents reconcile promptly and converge to fully-Ready instead of waiting
+// out an exponential backoff.
+func (r *RoleReconciler) enqueueRequestsForInheritedRoleChange(ctx context.Context, obj client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+	changedRole, ok := obj.(*iamdatumapiscomv1alpha1.Role)
+	if !ok {
+		log.Error(fmt.Errorf("unexpected object type in Role inheritance handler: %T", obj), "cannot enqueue Roles")
+		return []reconcile.Request{}
+	}
+
+	roleList := &iamdatumapiscomv1alpha1.RoleList{}
+	if err := r.List(ctx, roleList); err != nil {
+		log.Error(err, "failed to list Roles for inherited-role change handler")
+		return []reconcile.Request{}
+	}
+
+	requests := make([]reconcile.Request, 0)
+	for i := range roleList.Items {
+		dependent := &roleList.Items[i]
+		// The role's own changes are already handled by the primary For()
+		// watch; only enqueue other roles that inherit it.
+		if dependent.Namespace == changedRole.Namespace && dependent.Name == changedRole.Name {
+			continue
+		}
+		for _, ref := range dependent.Spec.InheritedRoles {
+			refNamespace := dependent.Namespace
+			if ref.Namespace != "" {
+				refNamespace = ref.Namespace
+			}
+			if refNamespace == changedRole.Namespace && ref.Name == changedRole.Name {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: client.ObjectKey{Name: dependent.Name, Namespace: dependent.Namespace},
+				})
+				log.V(1).Info("Enqueuing Role due to inherited Role change",
+					"roleName", dependent.Name, "roleNamespace", dependent.Namespace,
+					"changedRole", changedRole.Namespace+"/"+changedRole.Name)
+				break
+			}
+		}
+	}
+	return requests
 }
 
 // validateRolePermissions checks if all effective permissions in a role are validly defined by known ProtectedResources.
@@ -175,7 +319,10 @@ func (r *RoleReconciler) isRoleAffectedByProtectedResource(ctx context.Context, 
 		"serviceRef", pr.Spec.ServiceRef.Name, "kindDefined", pr.Spec.Kind,
 	)
 
-	effectivePermissions, err := r.getAllEffectivePermissions(ctx, role, nil)
+	// Unresolved inherited references are ignored here: a degraded role can
+	// still be affected by a ProtectedResource change through the permissions
+	// it does resolve.
+	effectivePermissions, _, err := r.getAllEffectivePermissions(ctx, role, nil)
 	if err != nil {
 		roleLog.V(1).Info("Could not get effective permissions for role, cannot determine if affected by ProtectedResource change", "error", err.Error())
 		return false, err
@@ -257,9 +404,15 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	// Compute effective permissions once for both status population and validation
-	effectivePermissions, effectivePermsErr := r.getAllEffectivePermissions(ctx, role, nil)
+	// Compute effective permissions once for both status population and
+	// validation. Unresolved inheritedRoles references degrade the role
+	// gracefully (the resolvable permissions are still applied) instead of
+	// zeroing out every permission the role grants.
+	effectivePermissions, unresolvedRoles, effectivePermsErr := r.getAllEffectivePermissions(ctx, role, nil)
 	if effectivePermsErr != nil {
+		// Only genuine errors (for example, a non-NotFound API failure) reach
+		// here; a missing inherited role is reported via unresolvedRoles
+		// instead. Retry with backoff for the transient failure.
 		log.Error(effectivePermsErr, "Failed to compute effective permissions for role")
 		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
 			Type:               "Ready",
@@ -276,6 +429,13 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Sort for deterministic output and populate status
 	sort.Strings(effectivePermissions)
 	role.Status.EffectivePermissions = effectivePermissions
+
+	// Record the degraded state (if any) as a dedicated condition and event so
+	// an unresolved reference is immediately diagnosable on the Role itself,
+	// rather than manifesting as mystery Forbidden errors on unrelated
+	// resources. The Degraded condition is set regardless of whether OpenFGA
+	// reconciliation proceeds below.
+	r.setDegradedCondition(ctx, role, unresolvedRoles, currentGeneration)
 
 	invalidPermissions, validationErr := r.validateRolePermissions(ctx, role, protectedResourceList.Items, effectivePermissions)
 	permValidationCondition := metav1.Condition{
@@ -317,14 +477,30 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			}
 			return ctrl.Result{}, err
 		}
-		log.Info("Role successfully reconciled with OpenFGA")
-		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "ReconciliationSuccessful",
-			Message:            "Role reconciled successfully with OpenFGA.",
-			ObservedGeneration: currentGeneration,
-		})
+		if len(unresolvedRoles) > 0 {
+			// Resolvable permissions were applied to OpenFGA, but the role is
+			// not fully Ready until every inherited reference resolves. Stay
+			// non-Ready (and Degraded) so the misconfiguration is visible and
+			// so the role converges to fully-Ready once the reference appears.
+			log.Info("Role reconciled with OpenFGA in a degraded state due to unresolved inherited roles",
+				"unresolvedInheritedRoles", unresolvedRefStrings(unresolvedRoles))
+			meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "UnresolvedInheritedRoles",
+				Message:            unresolvedMessage(unresolvedRoles),
+				ObservedGeneration: currentGeneration,
+			})
+		} else {
+			log.Info("Role successfully reconciled with OpenFGA")
+			meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "ReconciliationSuccessful",
+				Message:            "Role reconciled successfully with OpenFGA.",
+				ObservedGeneration: currentGeneration,
+			})
+		}
 	} else {
 		log.Info("Skipping OpenFGA reconciliation due to invalid permissions.")
 		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
@@ -419,6 +595,14 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.ProtectedResource{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueueRequestsForProtectedResourceChange),
+	)
+
+	// Watch Roles so that when a previously-missing inherited Role appears, the
+	// Roles that inherit it reconcile promptly and converge without waiting out
+	// the controller's exponential backoff.
+	controllerBuilder.Watches(
+		&iamdatumapiscomv1alpha1.Role{},
+		handler.EnqueueRequestsFromMapFunc(r.enqueueRequestsForInheritedRoleChange),
 	)
 
 	return controllerBuilder.Complete(r)
