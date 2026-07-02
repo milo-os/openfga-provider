@@ -22,6 +22,23 @@ func TestTargetObjectFromResourceSelector(t *testing.T) {
 	}
 }
 
+func TestTargetObjectFromResourceSelectorWithNamespace(t *testing.T) {
+	key, err := TargetObjectFromResourceSelector(iamdatumapiscomv1alpha1.ResourceSelector{
+		ResourceRef: &iamdatumapiscomv1alpha1.ResourceReference{
+			APIGroup:  "resourcemanager.miloapis.com",
+			Kind:      "Project",
+			Name:      "proj-abc",
+			Namespace: "org-ns",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if key != "resourcemanager.miloapis.com/Project:org-ns/proj-abc" {
+		t.Fatalf("got %q", key)
+	}
+}
+
 func TestTargetKindFromResourceSelector(t *testing.T) {
 	key, err := TargetKindFromResourceSelector(iamdatumapiscomv1alpha1.ResourceSelector{
 		ResourceRef: &iamdatumapiscomv1alpha1.ResourceReference{
@@ -39,11 +56,20 @@ func TestTargetKindFromResourceSelector(t *testing.T) {
 }
 
 func TestRoleRefIndexKey(t *testing.T) {
-	key := RoleRefIndexKey(iamdatumapiscomv1alpha1.RoleReference{
+	key := RoleRefIndexKey("datum-cloud", iamdatumapiscomv1alpha1.RoleReference{
 		Name:      "owner",
 		Namespace: "datum-cloud",
 	})
 	if key != "datum-cloud/owner" {
+		t.Fatalf("got %q", key)
+	}
+}
+
+func TestRoleRefIndexKeyDefaultsToPolicyBindingNamespace(t *testing.T) {
+	key := RoleRefIndexKey("org-abc", iamdatumapiscomv1alpha1.RoleReference{
+		Name: "owner",
+	})
+	if key != "org-abc/owner" {
 		t.Fatalf("got %q", key)
 	}
 }

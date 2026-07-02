@@ -87,6 +87,9 @@ type PolicyBindingReconciler struct {
 	StoreID       string
 	Finalizers    finalizer.Finalizers
 	EventRecorder record.EventRecorder
+	// MaxConcurrentReconciles controls PolicyBinding reconcile parallelism.
+	// When zero, defaultPolicyBindingMaxConcurrentReconciles is used.
+	MaxConcurrentReconciles int
 }
 
 // Reconcile is the core reconciliation loop for PolicyBinding resources. It is called by the controller-runtime when a
@@ -746,7 +749,7 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 		"roleNamespace", changedRole.Namespace)
 
 	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	roleKey := openfga.RoleRefIndexKey(iamdatumapiscomv1alpha1.RoleReference{
+	roleKey := openfga.RoleRefIndexKey(changedRole.Namespace, iamdatumapiscomv1alpha1.RoleReference{
 		Name:      changedRole.Name,
 		Namespace: changedRole.Namespace,
 	})
@@ -815,8 +818,15 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	)
 
 	return controllerBuilder.WithOptions(controller.Options{
-		MaxConcurrentReconciles: defaultPolicyBindingMaxConcurrentReconciles,
+		MaxConcurrentReconciles: r.policyBindingMaxConcurrentReconciles(),
 	}).Complete(r)
+}
+
+func (r *PolicyBindingReconciler) policyBindingMaxConcurrentReconciles() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return defaultPolicyBindingMaxConcurrentReconciles
 }
 
 func (r *PolicyBindingReconciler) setupPolicyBindingIndexes(mgr ctrl.Manager) error {
@@ -853,7 +863,7 @@ func (r *PolicyBindingReconciler) setupPolicyBindingIndexes(mgr ctrl.Manager) er
 		if !ok {
 			return nil
 		}
-		return []string{openfga.RoleRefIndexKey(policyBinding.Spec.RoleRef)}
+		return []string{openfga.RoleRefIndexKey(policyBinding.Namespace, policyBinding.Spec.RoleRef)}
 	}); err != nil {
 		return fmt.Errorf("index PolicyBinding roleRef: %w", err)
 	}
