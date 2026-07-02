@@ -117,18 +117,17 @@ spec:
               metadata:
                 name: binding-a-user-a-only
               status:
-                conditions:
-                  - type: TargetValid
-                    status: "True"
+                (conditions[?type == 'TargetValid']):
+                  - status: "True"
                     reason: ValidationSuccessful
-                  - type: SubjectValid
-                    status: "True"
+                (conditions[?type == 'SubjectValid']):
+                  - status: "True"
                     reason: ValidationSuccessful
-                  - type: RoleValid
-                    status: "True"
+                (conditions[?type == 'RoleValid']):
+                  - status: "True"
                     reason: ValidationSuccessful
-                  - type: Ready
-                    status: "True"
+                (conditions[?type == 'Ready']):
+                  - status: "True"
                     reason: ReconciliationSuccessful
         - assert:
             resource:
@@ -137,18 +136,17 @@ spec:
               metadata:
                 name: binding-b-both-users
               status:
-                conditions:
-                  - type: TargetValid
-                    status: "True"
+                (conditions[?type == 'TargetValid']):
+                  - status: "True"
                     reason: ValidationSuccessful
-                  - type: SubjectValid
-                    status: "True"
+                (conditions[?type == 'SubjectValid']):
+                  - status: "True"
                     reason: ValidationSuccessful
-                  - type: RoleValid
-                    status: "True"
+                (conditions[?type == 'RoleValid']):
+                  - status: "True"
                     reason: ValidationSuccessful
-                  - type: Ready
-                    status: "True"
+                (conditions[?type == 'Ready']):
+                  - status: "True"
                     reason: ReconciliationSuccessful
 
         # Verify user-a is authorized.
