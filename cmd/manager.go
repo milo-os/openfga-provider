@@ -59,6 +59,7 @@ func createManagerCommand() *cobra.Command {
 	var serverConfigFile string
 	var upstreamClusterKubeconfig string
 	var coreControlPlaneKubeconfig string
+	var policyBindingMaxConcurrentReconciles int
 
 	cmd := &cobra.Command{
 		Use:   "manager",
@@ -83,6 +84,7 @@ func createManagerCommand() *cobra.Command {
 				serverConfigFile,
 				upstreamClusterKubeconfig,
 				coreControlPlaneKubeconfig,
+				policyBindingMaxConcurrentReconciles,
 			)
 		},
 	}
@@ -112,6 +114,8 @@ func createManagerCommand() *cobra.Command {
 	cmd.Flags().StringVar(&serverConfigFile, "server-config", "", "path to the server config file")
 	cmd.Flags().StringVar(&upstreamClusterKubeconfig, "upstream-kubeconfig", "", "Path to the kubeconfig file for the upstream cluster")
 	cmd.Flags().StringVar(&coreControlPlaneKubeconfig, "core-control-plane-kubeconfig", "", "Path to the kubeconfig file for the core control plane cluster")
+	cmd.Flags().IntVar(&policyBindingMaxConcurrentReconciles, "policybinding-max-concurrent-reconciles", 8,
+		"Maximum number of concurrent PolicyBinding reconciles.")
 
 	// Mark required flags
 	if err := cmd.MarkFlagRequired("openfga-api-url"); err != nil {
@@ -143,6 +147,7 @@ func runManager(
 	serverConfigFile string,
 	upstreamClusterKubeconfig string,
 	coreControlPlaneKubeconfig string,
+	policyBindingMaxConcurrentReconciles int,
 ) error {
 	opts := zap.Options{
 		Development: true,
@@ -282,11 +287,12 @@ func runManager(
 	}
 
 	if err = (&controller.PolicyBindingReconciler{
-		Client:        localMgr.GetClient(),
-		Scheme:        localMgr.GetScheme(),
-		FgaClient:     fgaClient,
-		StoreID:       openfgaStoreID,
-		EventRecorder: localMgr.GetEventRecorderFor("policybinding-controller"),
+		Client:                  localMgr.GetClient(),
+		Scheme:                  localMgr.GetScheme(),
+		FgaClient:               fgaClient,
+		StoreID:                 openfgaStoreID,
+		EventRecorder:           localMgr.GetEventRecorderFor("policybinding-controller"),
+		MaxConcurrentReconciles: policyBindingMaxConcurrentReconciles,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller PolicyBinding: %w", err)
 	}

@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -31,6 +32,9 @@ import (
 
 const (
 	policyBindingFinalizerKey = "iam.miloapis.com/policybinding"
+	// defaultPolicyBindingMaxConcurrentReconciles allows the controller to drain
+	// the workqueue faster on clusters with many PolicyBindings.
+	defaultPolicyBindingMaxConcurrentReconciles = 8
 	// ConditionTypeSubjectValid represents the condition type for validating the subjects (users or groups) referenced in
 	// a PolicyBinding. This condition is True if all subjects are found, recognized by the API server, and have valid
 	// UIDs.
@@ -83,6 +87,9 @@ type PolicyBindingReconciler struct {
 	StoreID       string
 	Finalizers    finalizer.Finalizers
 	EventRecorder record.EventRecorder
+	// MaxConcurrentReconciles controls PolicyBinding reconcile parallelism.
+	// When zero, defaultPolicyBindingMaxConcurrentReconciles is used.
+	MaxConcurrentReconciles int
 }
 
 // Reconcile is the core reconciliation loop for PolicyBinding resources. It is called by the controller-runtime when a
@@ -703,43 +710,24 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForProtectedResourceChang
 		"kindDefined", protectedResource.Spec.Kind)
 
 	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	errs := r.List(context.Background(), policyBindings) // List all policy bindings in the cluster.
-	if errs != nil {
-		log.Error(errs, "failed to list PolicyBindings for ProtectedResource change")
+	targetKindKey := fmt.Sprintf("%s/%s", protectedResource.Spec.ServiceRef.Name, protectedResource.Spec.Kind)
+	if err := r.List(ctx, policyBindings, client.MatchingFields{
+		openfga.TargetKindIndexField: targetKindKey,
+	}); err != nil {
+		log.Error(err, "failed to list PolicyBindings for ProtectedResource change")
 		return []reconcile.Request{}
 	}
 
-	requests := make([]reconcile.Request, 0)
+	requests := make([]reconcile.Request, 0, len(policyBindings.Items))
 	for _, pb := range policyBindings.Items {
-		var shouldEnqueue bool
-		var targetAPIGroup, targetKind string
-
-		// Extract APIGroup and Kind based on ResourceSelector type
-		if pb.Spec.ResourceSelector.ResourceRef != nil {
-			targetAPIGroup = pb.Spec.ResourceSelector.ResourceRef.APIGroup
-			targetKind = pb.Spec.ResourceSelector.ResourceRef.Kind
-		} else if pb.Spec.ResourceSelector.ResourceKind != nil {
-			targetAPIGroup = pb.Spec.ResourceSelector.ResourceKind.APIGroup
-			targetKind = pb.Spec.ResourceSelector.ResourceKind.Kind
-		}
-
-		// A PolicyBinding should be re-evaluated if its target APIGroup and Kind match the ServiceRef.Name and Kind of
-		// the changed ProtectedResource.
-		if targetAPIGroup == protectedResource.Spec.ServiceRef.Name &&
-			targetKind == protectedResource.Spec.Kind {
-			shouldEnqueue = true
-		}
-
-		if shouldEnqueue {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      pb.Name,
-					Namespace: pb.Namespace,
-				},
-			})
-			log.V(1).Info("Enqueuing PolicyBinding due to relevant ProtectedResource change",
-				"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace)
-		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      pb.Name,
+				Namespace: pb.Namespace,
+			},
+		})
+		log.V(1).Info("Enqueuing PolicyBinding due to relevant ProtectedResource change",
+			"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace)
 	}
 
 	return requests
@@ -761,26 +749,28 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 		"roleNamespace", changedRole.Namespace)
 
 	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	if err := r.List(ctx, policyBindings); err != nil {
+	roleKey := openfga.RoleRefIndexKey(changedRole.Namespace, iamdatumapiscomv1alpha1.RoleReference{
+		Name:      changedRole.Name,
+		Namespace: changedRole.Namespace,
+	})
+	if err := r.List(ctx, policyBindings, client.MatchingFields{
+		openfga.RoleRefIndexField: roleKey,
+	}); err != nil {
 		log.Error(err, "failed to list PolicyBindings for Role change", "roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
 		return []reconcile.Request{}
 	}
 
-	requests := make([]reconcile.Request, 0)
+	requests := make([]reconcile.Request, 0, len(policyBindings.Items))
 	for _, pb := range policyBindings.Items {
-		// A PolicyBinding should be re-evaluated if its RoleRef matches the changed Role. The RoleRef in PolicyBindingSpec
-		// contains Name and Namespace. An empty RoleRef.Namespace typically refers to a cluster-scoped Role.
-		if pb.Spec.RoleRef.Name == changedRole.Name && pb.Spec.RoleRef.Namespace == changedRole.Namespace {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      pb.Name,
-					Namespace: pb.Namespace, // This is the PolicyBinding's namespace
-				},
-			})
-			log.V(1).Info("Enqueuing PolicyBinding due to relevant Role change",
-				"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace,
-				"changedRoleName", changedRole.Name, "changedRoleNamespace", changedRole.Namespace)
-		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      pb.Name,
+				Namespace: pb.Namespace,
+			},
+		})
+		log.V(1).Info("Enqueuing PolicyBinding due to relevant Role change",
+			"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace,
+			"changedRoleName", changedRole.Name, "changedRoleNamespace", changedRole.Namespace)
 	}
 	return requests
 }
@@ -790,6 +780,10 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.RESTMapper == nil {
 		r.RESTMapper = mgr.GetRESTMapper()
+	}
+
+	if err := r.setupPolicyBindingIndexes(mgr); err != nil {
+		return err
 	}
 
 	// Initialize finalizers
@@ -823,5 +817,56 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		handler.EnqueueRequestsFromMapFunc(r.enqueuePolicyBindingsForRoleChange),
 	)
 
-	return controllerBuilder.Complete(r)
+	return controllerBuilder.WithOptions(controller.Options{
+		MaxConcurrentReconciles: r.policyBindingMaxConcurrentReconciles(),
+	}).Complete(r)
+}
+
+func (r *PolicyBindingReconciler) policyBindingMaxConcurrentReconciles() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return defaultPolicyBindingMaxConcurrentReconciles
+}
+
+func (r *PolicyBindingReconciler) setupPolicyBindingIndexes(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iamdatumapiscomv1alpha1.PolicyBinding{}, openfga.TargetObjectIndexField, func(rawObj client.Object) []string {
+		policyBinding, ok := rawObj.(*iamdatumapiscomv1alpha1.PolicyBinding)
+		if !ok {
+			return nil
+		}
+		key, err := openfga.TargetObjectFromResourceSelector(policyBinding.Spec.ResourceSelector)
+		if err != nil {
+			return nil
+		}
+		return []string{key}
+	}); err != nil {
+		return fmt.Errorf("index PolicyBinding target object: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iamdatumapiscomv1alpha1.PolicyBinding{}, openfga.TargetKindIndexField, func(rawObj client.Object) []string {
+		policyBinding, ok := rawObj.(*iamdatumapiscomv1alpha1.PolicyBinding)
+		if !ok {
+			return nil
+		}
+		key, err := openfga.TargetKindFromResourceSelector(policyBinding.Spec.ResourceSelector)
+		if err != nil {
+			return nil
+		}
+		return []string{key}
+	}); err != nil {
+		return fmt.Errorf("index PolicyBinding target kind: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iamdatumapiscomv1alpha1.PolicyBinding{}, openfga.RoleRefIndexField, func(rawObj client.Object) []string {
+		policyBinding, ok := rawObj.(*iamdatumapiscomv1alpha1.PolicyBinding)
+		if !ok {
+			return nil
+		}
+		return []string{openfga.RoleRefIndexKey(policyBinding.Namespace, policyBinding.Spec.RoleRef)}
+	}); err != nil {
+		return fmt.Errorf("index PolicyBinding roleRef: %w", err)
+	}
+
+	return nil
 }

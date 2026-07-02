@@ -46,6 +46,7 @@ spec:
           - --configmap-namespace=$(CONFIGMAP_NAMESPACE)
           - --server-config=$(OPENFGA_CONTROLLER_MANAGER_CONFIG_PATH)
           - --core-control-plane-kubeconfig=$(CORE_CONTROL_PLANE_KUBECONFIG_PATH)
+          - --policybinding-max-concurrent-reconciles=8
         env:
         - name: POD_NAMESPACE
           valueFrom:
