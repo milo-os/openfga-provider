@@ -289,10 +289,10 @@ func runManager(
 	if err = (&controller.PolicyBindingReconciler{
 		Client:                  localMgr.GetClient(),
 		Scheme:                  localMgr.GetScheme(),
-		FgaClient:                 fgaClient,
-		StoreID:                   openfgaStoreID,
-		EventRecorder:             localMgr.GetEventRecorderFor("policybinding-controller"),
-		MaxConcurrentReconciles:   policyBindingMaxConcurrentReconciles,
+		FgaClient:               fgaClient,
+		StoreID:                 openfgaStoreID,
+		EventRecorder:           localMgr.GetEventRecorderFor("policybinding-controller"),
+		MaxConcurrentReconciles: policyBindingMaxConcurrentReconciles,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller PolicyBinding: %w", err)
 	}
