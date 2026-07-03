@@ -23,12 +23,17 @@ spec:
                 name: ns-ref-test-org
               spec:
                 type: Standard
-        - apply:
+        - create:
             resource:
               apiVersion: iam.miloapis.com/v1alpha1
               kind: User
               metadata:
                 name: ns-ref-test-user
+              spec:
+                email: ns-ref-test-user@test.datum.net
+            outputs:
+              - name: user
+                value: (@)
         - apply:
             file: roles/membership-viewer.yaml
         - wait:
@@ -68,7 +73,7 @@ spec:
                 subjects:
                   - kind: User
                     name: ns-ref-test-user
-                    uid: ns-ref-test-user
+                    uid: ($user.metadata.uid)
                 resourceSelector:
                   resourceRef:
                     apiGroup: resourcemanager.miloapis.com
@@ -107,7 +112,7 @@ spec:
                         "kind": "SubjectAccessReview",
                         "spec": {
                           "user": "ns-ref-test-user",
-                          "uid": "ns-ref-test-user",
+                          "uid": "($user.metadata.uid)",
                           "extra": {
                             "resourcemanager.miloapis.com/organization-id": ["ns-ref-test-org"]
                           },
