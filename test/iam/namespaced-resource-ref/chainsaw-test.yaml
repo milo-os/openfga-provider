@@ -112,7 +112,7 @@ spec:
                         "kind": "SubjectAccessReview",
                         "spec": {
                           "user": "ns-ref-test-user",
-                          "uid": "($user.metadata.uid)",
+                          "uid": "ns-ref-test-user",
                           "extra": {
                             "resourcemanager.miloapis.com/organization-id": ["ns-ref-test-org"]
                           },
