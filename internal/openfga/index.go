@@ -16,12 +16,11 @@ const (
 )
 
 // TargetObjectFromResourceSelector returns the OpenFGA target object identifier for a selector.
+// For resourceRef targets the object key is always apiGroup/Kind:name, matching buildResourceObject
+// in the auth webhook. resourceRef.namespace is used when fetching the target CR, not in the tuple key.
 func TargetObjectFromResourceSelector(selector iamdatumapiscomv1alpha1.ResourceSelector) (string, error) {
 	if selector.ResourceRef != nil {
 		ref := selector.ResourceRef
-		if ref.Namespace != "" {
-			return fmt.Sprintf("%s/%s:%s/%s", ref.APIGroup, ref.Kind, ref.Namespace, ref.Name), nil
-		}
 		return fmt.Sprintf("%s/%s:%s", ref.APIGroup, ref.Kind, ref.Name), nil
 	}
 
