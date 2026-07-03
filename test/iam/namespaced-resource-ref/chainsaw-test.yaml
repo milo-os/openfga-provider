@@ -1,0 +1,147 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: namespaced-resource-ref
+spec:
+  description: |
+    PolicyBindings on namespaced resources must write OpenFGA tuples using
+    apiGroup/Kind:name so auth webhook checks hit the same object key.
+  steps:
+    - name: setup-and-verify-authz
+      try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: organization-ns-ref-test-org
+        - apply:
+            resource:
+              apiVersion: resourcemanager.miloapis.com/v1alpha1
+              kind: Organization
+              metadata:
+                name: ns-ref-test-org
+              spec:
+                type: Standard
+        - apply:
+            resource:
+              apiVersion: iam.miloapis.com/v1alpha1
+              kind: User
+              metadata:
+                name: ns-ref-test-user
+        - apply:
+            file: roles/membership-viewer.yaml
+        - wait:
+            apiVersion: iam.miloapis.com/v1alpha1
+            kind: Role
+            name: ns-ref-membership-viewer
+            timeout: 5m
+            for:
+              condition:
+                name: Ready
+                value: "true"
+        - create:
+            resource:
+              apiVersion: resourcemanager.miloapis.com/v1alpha1
+              kind: OrganizationMembership
+              metadata:
+                name: test-member
+                namespace: organization-ns-ref-test-org
+              spec:
+                organizationRef:
+                  name: ns-ref-test-org
+                userRef:
+                  name: ns-ref-test-user
+            outputs:
+              - name: membership
+                value: (@)
+        - apply:
+            resource:
+              apiVersion: iam.miloapis.com/v1alpha1
+              kind: PolicyBinding
+              metadata:
+                name: ns-ref-membership-binding
+              spec:
+                roleRef:
+                  name: ns-ref-membership-viewer
+                  namespace: ($namespace)
+                subjects:
+                  - kind: User
+                    name: ns-ref-test-user
+                    uid: ns-ref-test-user
+                resourceSelector:
+                  resourceRef:
+                    apiGroup: resourcemanager.miloapis.com
+                    kind: OrganizationMembership
+                    name: test-member
+                    namespace: organization-ns-ref-test-org
+                    uid: ($membership.metadata.uid)
+        - wait:
+            apiVersion: iam.miloapis.com/v1alpha1
+            kind: PolicyBinding
+            name: ns-ref-membership-binding
+            timeout: 5m
+            for:
+              condition:
+                name: Ready
+                value: "true"
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: ns-ref-authz-check
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: curl
+                  image: curlimages/curl:latest
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      response=$(curl -ksS https://auth-provider-openfga-authz-webhook.auth-provider-openfga-system.svc.cluster.local:8090/apis/authorization.k8s.io/v1/subjectaccessreviews \
+                        -H "Content-Type: application/json" \
+                        -d @- << EOF
+                      {
+                        "apiVersion": "authorization.k8s.io/v1",
+                        "kind": "SubjectAccessReview",
+                        "spec": {
+                          "user": "ns-ref-test-user",
+                          "uid": "ns-ref-test-user",
+                          "extra": {
+                            "resourcemanager.miloapis.com/organization-id": ["ns-ref-test-org"]
+                          },
+                          "groups": ["system:authenticated"],
+                          "resourceAttributes": {
+                            "group": "resourcemanager.miloapis.com",
+                            "resource": "organizationmemberships",
+                            "version": "v1alpha1",
+                            "verb": "get",
+                            "name": "test-member",
+                            "namespace": "organization-ns-ref-test-org"
+                          }
+                        }
+                      }
+                      EOF
+                      )
+                      echo "Webhook response: $response"
+                      if ! echo "$response" | grep -q '"kind":"SubjectAccessReview"'; then
+                        echo "FAIL: invalid response format"
+                        exit 1
+                      fi
+                      if echo "$response" | grep -q '"allowed"[[:space:]]*:[[:space:]]*true'; then
+                        echo "PASS: user authorized for namespaced membership get"
+                        exit 0
+                      else
+                        echo "FAIL: user not authorized"
+                        exit 1
+                      fi
+        - wait:
+            apiVersion: v1
+            kind: Pod
+            name: ns-ref-authz-check
+            timeout: 30s
+            for:
+              jsonPath:
+                path: "status.phase"
+                value: "Succeeded"

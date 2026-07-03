@@ -34,7 +34,7 @@ func TestTargetObjectFromResourceSelectorWithNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if key != "resourcemanager.miloapis.com/Project:org-ns/proj-abc" {
+	if key != "resourcemanager.miloapis.com/Project:proj-abc" {
 		t.Fatalf("got %q", key)
 	}
 }
