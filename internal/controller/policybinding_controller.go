@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -185,12 +186,11 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	// At this juncture, both ResourceSelector and all Subjects have been successfully validated. Their respective conditions
-	// (TargetValid=True, SubjectValid=True) have been set in memory by their validation functions. We need to persist
-	// these positive statuses before proceeding to the OpenFGA reconciliation, which is an external call.
-	if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after successful validations before OpenFGA reconciliation: %w", err)
-	}
+	// Both ResourceSelector and all Subjects validated (TargetValid=True,
+	// SubjectValid=True set in memory). These positive conditions are persisted
+	// together with RoleValid and Ready in the single status write at the end of
+	// this reconcile. Failure paths (OpenFGA reconcile errors) still persist the
+	// in-memory conditions on their own.
 
 	// Reconcile with OpenFGA. This creates/updates/deletes tuples in OpenFGA based on the PolicyBinding. This step also
 	// implicitly validates the RoleRef by attempting to use the role.
@@ -502,15 +502,43 @@ func (r *PolicyBindingReconciler) updatePolicyBindingStatus(ctx context.Context,
 
 	policyBinding.Status.ObservedGeneration = observedGen
 
-	// Only update if the status has actually changed
-	if !equality.Semantic.DeepEqual(oldStatus, &policyBinding.Status) {
-		if err := r.Status().Update(ctx, policyBinding); err != nil {
-			return err
-		}
-		log.V(1).Info("PolicyBinding status updated")
-	} else {
+	// Only update if the status has actually changed.
+	if equality.Semantic.DeepEqual(oldStatus, &policyBinding.Status) {
 		log.V(1).Info("PolicyBinding status unchanged; skipping update")
+		return nil
 	}
+
+	// The reconcile loop computes the desired status against the version read at
+	// its start, but by the time we write, another actor (the finalizer update,
+	// a spec change, or a concurrent reconcile) may have bumped the object's
+	// resourceVersion, producing a conflict. Retry on conflict by re-fetching the
+	// latest object and re-applying the computed status so a stale read does not
+	// leave the binding without a Ready condition.
+	desiredStatus := policyBinding.Status.DeepCopy()
+	key := client.ObjectKeyFromObject(policyBinding)
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &iamdatumapiscomv1alpha1.PolicyBinding{}
+		if getErr := r.Get(ctx, key, latest); getErr != nil {
+			return getErr
+		}
+
+		desiredStatus.DeepCopyInto(&latest.Status)
+		if updateErr := r.Status().Update(ctx, latest); updateErr != nil {
+			return updateErr
+		}
+
+		// Reflect the persisted state back onto the caller's object so later use
+		// of policyBinding (logging, requeue decisions) sees the fresh version.
+		latest.Status.DeepCopyInto(&policyBinding.Status)
+		policyBinding.ResourceVersion = latest.ResourceVersion
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	log.V(1).Info("PolicyBinding status updated")
 	return nil
 }
 
