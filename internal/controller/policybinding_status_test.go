@@ -2,17 +2,15 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"sync/atomic"
 	"testing"
 
 	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 func policyBinding(namespace, name string) *iamv1alpha1.PolicyBinding {
@@ -33,49 +31,47 @@ func readyPolicyBinding(namespace, name string) *iamv1alpha1.PolicyBinding {
 	return pb
 }
 
-// A single conflict on the status subresource must not drop the update: the
-// reconciler re-reads the latest object and re-applies the computed status, so
-// the binding still ends up with its Ready condition persisted.
-func TestUpdatePolicyBindingStatus_RetriesOnConflict(t *testing.T) {
+// The status write is a merge patch on the status subresource, so it persists
+// the computed conditions and observedGeneration in a single call.
+func TestUpdatePolicyBindingStatus_PatchesStatus(t *testing.T) {
 	s := degradationScheme(t)
 	stored := policyBinding("org-1", "binding-1")
 
-	var updates int32
+	var patches int32
 	c := fake.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(stored).
 		WithStatusSubresource(&iamv1alpha1.PolicyBinding{}).
 		WithInterceptorFuncs(interceptor.Funcs{
-			SubResourceUpdate: func(
+			SubResourcePatch: func(
 				ctx context.Context,
 				cl client.Client,
 				subResourceName string,
 				obj client.Object,
-				opts ...client.SubResourceUpdateOption,
+				patch client.Patch,
+				opts ...client.SubResourcePatchOption,
 			) error {
-				if atomic.AddInt32(&updates, 1) == 1 {
-					return apierrors.NewConflict(
-						schema.GroupResource{Group: iamv1alpha1.SchemeGroupVersion.Group, Resource: "policybindings"},
-						obj.GetName(),
-						fmt.Errorf("the object has been modified"),
-					)
-				}
-				return cl.Status().Update(ctx, obj, opts...)
+				atomic.AddInt32(&patches, 1)
+				return cl.Status().Patch(ctx, obj, patch, opts...)
 			},
 		}).
 		Build()
 
 	r := &PolicyBindingReconciler{Client: c, Scheme: s}
 
-	desired := readyPolicyBinding("org-1", "binding-1")
-	oldStatus := &iamv1alpha1.PolicyBindingStatus{}
+	current := policyBinding("org-1", "binding-1")
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(stored), current); err != nil {
+		t.Fatalf("get stored binding: %v", err)
+	}
+	oldStatus := current.Status.DeepCopy()
+	current.Status = readyPolicyBinding("org-1", "binding-1").Status
 
-	if err := r.updatePolicyBindingStatus(context.Background(), desired, oldStatus, 1); err != nil {
-		t.Fatalf("expected conflict to be retried, got error: %v", err)
+	if err := r.updatePolicyBindingStatus(context.Background(), current, oldStatus, 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if got := atomic.LoadInt32(&updates); got < 2 {
-		t.Fatalf("expected at least 2 status update attempts (1 conflict + 1 success), got %d", got)
+	if got := atomic.LoadInt32(&patches); got != 1 {
+		t.Fatalf("expected exactly 1 status patch, got %d", got)
 	}
 
 	persisted := &iamv1alpha1.PolicyBinding{}
@@ -83,10 +79,40 @@ func TestUpdatePolicyBindingStatus_RetriesOnConflict(t *testing.T) {
 		t.Fatalf("get persisted binding: %v", err)
 	}
 	if len(persisted.Status.Conditions) != 1 || persisted.Status.Conditions[0].Type != "Ready" {
-		t.Fatalf("expected Ready condition persisted after retry, got %+v", persisted.Status.Conditions)
+		t.Fatalf("expected Ready condition persisted, got %+v", persisted.Status.Conditions)
 	}
 	if persisted.Status.ObservedGeneration != 1 {
 		t.Fatalf("expected observedGeneration=1, got %d", persisted.Status.ObservedGeneration)
+	}
+}
+
+// A merge patch carries no resourceVersion, so a status write computed from a
+// stale (lagging-cache) read must still succeed rather than conflict.
+func TestUpdatePolicyBindingStatus_ConflictFreeOnStaleObject(t *testing.T) {
+	s := degradationScheme(t)
+	stored := policyBinding("org-1", "binding-1")
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(stored).
+		WithStatusSubresource(&iamv1alpha1.PolicyBinding{}).
+		Build()
+
+	r := &PolicyBindingReconciler{Client: c, Scheme: s}
+
+	current := policyBinding("org-1", "binding-1")
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(stored), current); err != nil {
+		t.Fatalf("get stored binding: %v", err)
+	}
+
+	// Simulate an informer read that is behind the API server: pin an old
+	// resourceVersion onto the in-memory object before writing status.
+	current.ResourceVersion = "1"
+	oldStatus := current.Status.DeepCopy()
+	current.Status = readyPolicyBinding("org-1", "binding-1").Status
+
+	if err := r.updatePolicyBindingStatus(context.Background(), current, oldStatus, 1); err != nil {
+		t.Fatalf("stale-read status write must not conflict, got: %v", err)
 	}
 }
 
@@ -97,21 +123,22 @@ func TestUpdatePolicyBindingStatus_SkipsWhenUnchanged(t *testing.T) {
 	stored := readyPolicyBinding("org-1", "binding-1")
 	stored.Status.ObservedGeneration = 1
 
-	var updates int32
+	var patches int32
 	c := fake.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(stored).
 		WithStatusSubresource(&iamv1alpha1.PolicyBinding{}).
 		WithInterceptorFuncs(interceptor.Funcs{
-			SubResourceUpdate: func(
+			SubResourcePatch: func(
 				ctx context.Context,
 				cl client.Client,
 				subResourceName string,
 				obj client.Object,
-				opts ...client.SubResourceUpdateOption,
+				patch client.Patch,
+				opts ...client.SubResourcePatchOption,
 			) error {
-				atomic.AddInt32(&updates, 1)
-				return cl.Status().Update(ctx, obj, opts...)
+				atomic.AddInt32(&patches, 1)
+				return cl.Status().Patch(ctx, obj, patch, opts...)
 			},
 		}).
 		Build()
@@ -126,7 +153,51 @@ func TestUpdatePolicyBindingStatus_SkipsWhenUnchanged(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if got := atomic.LoadInt32(&updates); got != 0 {
+	if got := atomic.LoadInt32(&patches); got != 0 {
 		t.Fatalf("expected no status writes when unchanged, got %d", got)
+	}
+}
+
+// The primary-watch predicate must ignore status-only updates (the source of
+// the self-inflicted reconcile storm) while still reconciling on spec,
+// finalizer, and deletion changes.
+func TestPolicyBindingReconcilePredicate(t *testing.T) {
+	p := policyBindingReconcilePredicate()
+
+	base := func() *iamv1alpha1.PolicyBinding {
+		pb := policyBinding("org-1", "binding-1")
+		pb.Generation = 1
+		pb.Finalizers = []string{policyBindingFinalizerKey}
+		return pb
+	}
+
+	statusOnly := base()
+	statusOnly.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue}}
+	statusOnly.ResourceVersion = "2"
+	if p.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: statusOnly}) {
+		t.Fatalf("status-only update should be ignored")
+	}
+
+	specChange := base()
+	specChange.Generation = 2
+	if !p.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: specChange}) {
+		t.Fatalf("generation change should trigger reconcile")
+	}
+
+	finalizerChange := base()
+	finalizerChange.Finalizers = nil
+	if !p.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: finalizerChange}) {
+		t.Fatalf("finalizer change should trigger reconcile")
+	}
+
+	deleting := base()
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	if !p.Update(event.UpdateEvent{ObjectOld: base(), ObjectNew: deleting}) {
+		t.Fatalf("deletion should trigger reconcile")
+	}
+
+	if !p.Update(event.UpdateEvent{ObjectOld: nil, ObjectNew: nil}) {
+		t.Fatalf("nil objects should default to reconcile")
 	}
 }

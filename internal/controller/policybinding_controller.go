@@ -21,13 +21,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -502,43 +504,28 @@ func (r *PolicyBindingReconciler) updatePolicyBindingStatus(ctx context.Context,
 
 	policyBinding.Status.ObservedGeneration = observedGen
 
-	// Only update if the status has actually changed.
+	// Only write if the status has actually changed.
 	if equality.Semantic.DeepEqual(oldStatus, &policyBinding.Status) {
 		log.V(1).Info("PolicyBinding status unchanged; skipping update")
 		return nil
 	}
 
-	// The reconcile loop computes the desired status against the version read at
-	// its start, but by the time we write, another actor (the finalizer update,
-	// a spec change, or a concurrent reconcile) may have bumped the object's
-	// resourceVersion, producing a conflict. Retry on conflict by re-fetching the
-	// latest object and re-applying the computed status so a stale read does not
-	// leave the binding without a Ready condition.
-	desiredStatus := policyBinding.Status.DeepCopy()
-	key := client.ObjectKeyFromObject(policyBinding)
+	// This controller is the only writer of PolicyBinding status: the API server
+	// audit log shows every status write coming from this controller, while milo
+	// only creates and deletes the object. A JSON merge patch against the status
+	// subresource therefore needs no optimistic concurrency. It carries no
+	// resourceVersion, so a lagging informer read cannot turn the write into a
+	// conflict, and there is no competing writer whose changes it could clobber.
+	// This replaces a read-modify-write Update that raced its own requeues and
+	// produced a burst of 409s on every binding during signup.
+	base := policyBinding.DeepCopy()
+	base.Status = *oldStatus
 
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &iamdatumapiscomv1alpha1.PolicyBinding{}
-		if getErr := r.Get(ctx, key, latest); getErr != nil {
-			return getErr
-		}
-
-		desiredStatus.DeepCopyInto(&latest.Status)
-		if updateErr := r.Status().Update(ctx, latest); updateErr != nil {
-			return updateErr
-		}
-
-		// Reflect the persisted state back onto the caller's object so later use
-		// of policyBinding (logging, requeue decisions) sees the fresh version.
-		latest.Status.DeepCopyInto(&policyBinding.Status)
-		policyBinding.ResourceVersion = latest.ResourceVersion
-		return nil
-	})
-	if err != nil {
+	if err := r.Status().Patch(ctx, policyBinding, client.MergeFrom(base)); err != nil {
 		return err
 	}
 
-	log.V(1).Info("PolicyBinding status updated")
+	log.V(1).Info("PolicyBinding status patched")
 	return nil
 }
 
@@ -830,7 +817,7 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&iamdatumapiscomv1alpha1.PolicyBinding{}).
+		For(&iamdatumapiscomv1alpha1.PolicyBinding{}, builder.WithPredicates(policyBindingReconcilePredicate())).
 		Named("policybinding")
 
 	// Watch for changes to ProtectedResource CRs and enqueue PolicyBindings that might be affected.
@@ -855,6 +842,30 @@ func (r *PolicyBindingReconciler) policyBindingMaxConcurrentReconciles() int {
 		return r.MaxConcurrentReconciles
 	}
 	return defaultPolicyBindingMaxConcurrentReconciles
+}
+
+// policyBindingReconcilePredicate filters PolicyBinding events on the primary
+// watch so the controller reconciles on creation, deletion, spec changes, and
+// finalizer changes, but ignores updates that only touch status. This
+// controller is the sole writer of status, so waking on its own status writes
+// only re-runs the full OpenFGA tuple diff and races the next write. Dropping
+// those events removes the self-inflicted reconcile storm that the audit log
+// showed generating repeated status-update conflicts on every binding created
+// during signup.
+func policyBindingReconcilePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectOld == nil || e.ObjectNew == nil {
+				return true
+			}
+			// Deletion is initiated by setting deletionTimestamp, which does not
+			// bump generation; catch that transition so finalizers still run.
+			deletionChanged := (e.ObjectOld.GetDeletionTimestamp() == nil) != (e.ObjectNew.GetDeletionTimestamp() == nil)
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				deletionChanged ||
+				!equalFinalizers(e.ObjectOld.GetFinalizers(), e.ObjectNew.GetFinalizers())
+		},
+	}
 }
 
 func (r *PolicyBindingReconciler) setupPolicyBindingIndexes(mgr ctrl.Manager) error {
