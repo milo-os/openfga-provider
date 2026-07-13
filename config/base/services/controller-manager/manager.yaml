@@ -47,6 +47,9 @@ spec:
           - --server-config=$(OPENFGA_CONTROLLER_MANAGER_CONFIG_PATH)
           - --core-control-plane-kubeconfig=$(CORE_CONTROL_PLANE_KUBECONFIG_PATH)
           - --policybinding-max-concurrent-reconciles=8
+          - --openfga-timeout=$(OPENFGA_TIMEOUT)
+          - --openfga-keepalive-time=$(OPENFGA_KEEPALIVE_TIME)
+          - --openfga-keepalive-timeout=$(OPENFGA_KEEPALIVE_TIMEOUT)
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -78,6 +81,12 @@ spec:
           value: ""
         - name: CORE_CONTROL_PLANE_KUBECONFIG_PATH
           value: ""
+        - name: OPENFGA_TIMEOUT
+          value: "15s"
+        - name: OPENFGA_KEEPALIVE_TIME
+          value: "30s"
+        - name: OPENFGA_KEEPALIVE_TIMEOUT
+          value: "10s"
         ports:
           - containerPort: 8080
             name: metrics
