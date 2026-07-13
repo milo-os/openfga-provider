@@ -22,11 +22,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -810,12 +812,14 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.ProtectedResource{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueuePolicyBindingsForProtectedResourceChange),
+		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	// Watch for changes to Role CRs and enqueue PolicyBindings that might be affected.
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.Role{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueuePolicyBindingsForRoleChange),
+		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	return controllerBuilder.WithOptions(controller.Options{
