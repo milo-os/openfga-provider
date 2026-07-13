@@ -16,10 +16,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -595,6 +597,7 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.ProtectedResource{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueueRequestsForProtectedResourceChange),
+		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	// Watch Roles so that when a previously-missing inherited Role appears, the
@@ -603,6 +606,7 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.Role{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueueRequestsForInheritedRoleChange),
+		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	return controllerBuilder.Complete(r)
