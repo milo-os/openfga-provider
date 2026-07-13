@@ -191,6 +191,7 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after successful validations before OpenFGA reconciliation: %w", err)
 	}
+	oldStatus = policyBinding.Status.DeepCopy()
 
 	// Reconcile with OpenFGA. This creates/updates/deletes tuples in OpenFGA based on the PolicyBinding. This step also
 	// implicitly validates the RoleRef by attempting to use the role.

@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/rest"
@@ -60,6 +61,9 @@ func createManagerCommand() *cobra.Command {
 	var upstreamClusterKubeconfig string
 	var coreControlPlaneKubeconfig string
 	var policyBindingMaxConcurrentReconciles int
+	var openfgaTimeout time.Duration
+	var openfgaKeepaliveTime time.Duration
+	var openfgaKeepaliveTimeout time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "manager",
@@ -85,6 +89,9 @@ func createManagerCommand() *cobra.Command {
 				upstreamClusterKubeconfig,
 				coreControlPlaneKubeconfig,
 				policyBindingMaxConcurrentReconciles,
+				openfgaTimeout,
+				openfgaKeepaliveTime,
+				openfgaKeepaliveTimeout,
 			)
 		},
 	}
@@ -116,6 +123,12 @@ func createManagerCommand() *cobra.Command {
 	cmd.Flags().StringVar(&coreControlPlaneKubeconfig, "core-control-plane-kubeconfig", "", "Path to the kubeconfig file for the core control plane cluster")
 	cmd.Flags().IntVar(&policyBindingMaxConcurrentReconciles, "policybinding-max-concurrent-reconciles", 8,
 		"Maximum number of concurrent PolicyBinding reconciles.")
+	cmd.Flags().DurationVar(&openfgaTimeout, "openfga-timeout", 15*time.Second,
+		"The timeout duration for OpenFGA API calls.")
+	cmd.Flags().DurationVar(&openfgaKeepaliveTime, "openfga-keepalive-time", 30*time.Second,
+		"The interval duration between keepalive pings to the OpenFGA server.")
+	cmd.Flags().DurationVar(&openfgaKeepaliveTimeout, "openfga-keepalive-timeout", 10*time.Second,
+		"The timeout duration to wait for a keepalive ping response from the OpenFGA server.")
 
 	// Mark required flags
 	if err := cmd.MarkFlagRequired("openfga-api-url"); err != nil {
@@ -148,6 +161,9 @@ func runManager(
 	upstreamClusterKubeconfig string,
 	coreControlPlaneKubeconfig string,
 	policyBindingMaxConcurrentReconciles int,
+	openfgaTimeout time.Duration,
+	openfgaKeepaliveTime time.Duration,
+	openfgaKeepaliveTimeout time.Duration,
 ) error {
 	opts := zap.Options{
 		Development: true,
@@ -208,6 +224,12 @@ func runManager(
 
 	conn, err := grpc.NewClient(openfgaAPIURL,
 		grpc.WithTransportCredentials(creds),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                openfgaKeepaliveTime,
+			Timeout:             openfgaKeepaliveTimeout,
+			PermitWithoutStream: true,
+		}),
+		grpc.WithUnaryInterceptor(timeoutUnaryInterceptor(openfgaTimeout)),
 	)
 	if err != nil {
 		return fmt.Errorf("unable to create gRPC connection to OpenFGA: %w", err)
@@ -503,4 +525,22 @@ func ignoreCanceled(err error) error {
 		return nil
 	}
 	return err
+}
+
+func timeoutUnaryInterceptor(timeout time.Duration) grpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		method string,
+		req, reply any,
+		cc *grpc.ClientConn,
+		invoker grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
 }
