@@ -54,7 +54,13 @@ func getAuthorizationModelComparisonOptions() []cmp.Option {
 			return a.Type < b.Type
 		}),
 		protocmp.SortRepeated(func(a, b *openfgav1.RelationReference) bool {
-			return a.Type < b.Type
+			if a.Type != b.Type {
+				return a.Type < b.Type
+			}
+			return a.GetRelation() < b.GetRelation()
+		}),
+		protocmp.SortRepeated(func(a, b *openfgav1.Userset) bool {
+			return fmt.Sprint(a) < fmt.Sprint(b)
 		}),
 	}
 }
@@ -236,7 +242,18 @@ func (r *AuthorizationModelReconciler) createExpectedAuthorizationModel(protecte
 		return getMinimalAuthorizationModel(), nil
 	}
 
-	resourceGraph, err := getResourceGraph(protectedResources)
+	sortedPRs := make([]iamdatumapiscomv1alpha1.ProtectedResource, len(protectedResources))
+	copy(sortedPRs, protectedResources)
+	sort.Slice(sortedPRs, func(i, j int) bool {
+		keyI := sortedPRs[i].Spec.ServiceRef.Name + "/" + sortedPRs[i].Spec.Kind
+		keyJ := sortedPRs[j].Spec.ServiceRef.Name + "/" + sortedPRs[j].Spec.Kind
+		if keyI != keyJ {
+			return keyI < keyJ
+		}
+		return sortedPRs[i].Name < sortedPRs[j].Name
+	})
+
+	resourceGraph, err := getResourceGraph(sortedPRs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get resource graph: %v", err)
 	}
@@ -284,7 +301,10 @@ func (r *AuthorizationModelReconciler) createExpectedAuthorizationModel(protecte
 }
 
 func getResourceParentRelatedTypes(parents []string) (relations []*openfgav1.RelationReference) {
-	for _, parent := range parents {
+	sortedParents := make([]string, len(parents))
+	copy(sortedParents, parents)
+	sort.Strings(sortedParents)
+	for _, parent := range sortedParents {
 		relations = append(relations, &openfgav1.RelationReference{
 			Type: parent,
 		})
@@ -520,6 +540,7 @@ func calculatePermissionsForNode(node *resourceGraphNode, permissionsMap map[str
 	}
 
 	nodePermissions = removeDuplicatePermissions(nodePermissions)
+	sort.Strings(nodePermissions)
 	permissionsMap[node.ResourceType] = nodePermissions
 
 	return nodePermissions

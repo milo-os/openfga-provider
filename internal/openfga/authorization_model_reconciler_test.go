@@ -576,3 +576,165 @@ func TestAuthorizationModel_MinimalModel(t *testing.T) {
 	assert.False(t, typeNames[TypeInternalRole], "minimal model should NOT contain InternalRole")
 	assert.False(t, typeNames[TypeRoot], "minimal model should NOT contain Root")
 }
+
+// TestAuthorizationModelReconciler_IdempotencyAndOrdering verifies that:
+// 1. Reconciling a set of ProtectedResources writes the authorization model once.
+// 2. Re-reconciling the exact same resources does NOT write a new model.
+// 3. Re-reconciling the resources in a completely different slice order does NOT write a new model.
+func TestAuthorizationModelReconciler_IdempotencyAndOrdering(t *testing.T) {
+	logf.SetLogger(zap.New())
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	prs := []iamdatumapiscomv1alpha1.ProtectedResource{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "organizations"},
+			Spec: iamdatumapiscomv1alpha1.ProtectedResourceSpec{
+				ServiceRef:  iamdatumapiscomv1alpha1.ServiceReference{Name: "resourcemanager.miloapis.com"},
+				Kind:        "Organization",
+				Plural:      "organizations",
+				Permissions: []string{"get", "list", "update", "delete"},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "projects"},
+			Spec: iamdatumapiscomv1alpha1.ProtectedResourceSpec{
+				ServiceRef:  iamdatumapiscomv1alpha1.ServiceReference{Name: "resourcemanager.miloapis.com"},
+				Kind:        "Project",
+				Plural:      "projects",
+				Permissions: []string{"get", "list", "update", "delete"},
+				ParentResources: []iamdatumapiscomv1alpha1.ParentResourceRef{
+					{
+						APIGroup: "resourcemanager.miloapis.com",
+						Kind:     "Organization",
+					},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "workloads"},
+			Spec: iamdatumapiscomv1alpha1.ProtectedResourceSpec{
+				ServiceRef:  iamdatumapiscomv1alpha1.ServiceReference{Name: "compute.miloapis.com"},
+				Kind:        "Workload",
+				Plural:      "workloads",
+				Permissions: []string{"get", "list", "create"},
+				ParentResources: []iamdatumapiscomv1alpha1.ParentResourceRef{
+					{
+						APIGroup: "resourcemanager.miloapis.com",
+						Kind:     "Project",
+					},
+				},
+			},
+		},
+	}
+
+	var storedModel *openfgav1.AuthorizationModel
+	writeCalls := 0
+
+	mockClient := &MockOpenFGAServiceClient{
+		ReadAuthorizationModelsFunc: func(ctx context.Context, in *openfgav1.ReadAuthorizationModelsRequest, opts ...grpc.CallOption) (*openfgav1.ReadAuthorizationModelsResponse, error) {
+			if storedModel == nil {
+				return &openfgav1.ReadAuthorizationModelsResponse{}, nil
+			}
+			return &openfgav1.ReadAuthorizationModelsResponse{
+				AuthorizationModels: []*openfgav1.AuthorizationModel{
+					{Id: storedModel.Id},
+				},
+			}, nil
+		},
+		ReadAuthorizationModelFunc: func(ctx context.Context, in *openfgav1.ReadAuthorizationModelRequest, opts ...grpc.CallOption) (*openfgav1.ReadAuthorizationModelResponse, error) {
+			// Simulate OpenFGA protobuf roundtrip
+			data, err := proto.Marshal(storedModel)
+			if err != nil {
+				return nil, err
+			}
+			unmarshaled := &openfgav1.AuthorizationModel{}
+			if err := proto.Unmarshal(data, unmarshaled); err != nil {
+				return nil, err
+			}
+			return &openfgav1.ReadAuthorizationModelResponse{
+				AuthorizationModel: unmarshaled,
+			}, nil
+		},
+		WriteAuthorizationModelFunc: func(ctx context.Context, in *openfgav1.WriteAuthorizationModelRequest, opts ...grpc.CallOption) (*openfgav1.WriteAuthorizationModelResponse, error) {
+			writeCalls++
+			modelID := "model-v1"
+			storedModel = &openfgav1.AuthorizationModel{
+				Id:              modelID,
+				SchemaVersion:   in.SchemaVersion,
+				TypeDefinitions: in.TypeDefinitions,
+				Conditions:      in.Conditions,
+			}
+			return &openfgav1.WriteAuthorizationModelResponse{
+				AuthorizationModelId: modelID,
+			}, nil
+		},
+	}
+
+	reconciler := &AuthorizationModelReconciler{
+		StoreID: "test-store",
+		OpenFGA: mockClient,
+	}
+
+	// 1. Initial write
+	err := reconciler.ReconcileAuthorizationModel(ctx, prs)
+	require.NoError(t, err)
+	assert.Equal(t, 1, writeCalls, "Initial reconcile should write model")
+
+	// 2. Second reconcile with identical input - should be no-op
+	err = reconciler.ReconcileAuthorizationModel(ctx, prs)
+	require.NoError(t, err)
+	assert.Equal(t, 1, writeCalls, "Second reconcile with same PRs should NOT write model")
+
+	// 3. Third reconcile with shuffled PRs - should be no-op
+	shuffledPRs := []iamdatumapiscomv1alpha1.ProtectedResource{prs[2], prs[0], prs[1]}
+	err = reconciler.ReconcileAuthorizationModel(ctx, shuffledPRs)
+	require.NoError(t, err)
+	assert.Equal(t, 1, writeCalls, "Third reconcile with shuffled PRs should NOT write model")
+}
+
+// TestAuthorizationModelsEqual_UsersetUnionChildOrdering verifies that authorizationModelsEqual
+// treats two models with reversed Userset union children as identical.
+func TestAuthorizationModelsEqual_UsersetUnionChildOrdering(t *testing.T) {
+	c1 := &openfgav1.Userset{Userset: &openfgav1.Userset_This{This: &openfgav1.DirectUserset{}}}
+	c2 := &openfgav1.Userset{Userset: &openfgav1.Userset_TupleToUserset{
+		TupleToUserset: &openfgav1.TupleToUserset{
+			Tupleset:        &openfgav1.ObjectRelation{Relation: "parent"},
+			ComputedUserset: &openfgav1.ObjectRelation{Relation: "read"},
+		},
+	}}
+
+	model1 := &openfgav1.AuthorizationModel{
+		SchemaVersion: "1.2",
+		TypeDefinitions: []*openfgav1.TypeDefinition{
+			{
+				Type: "test.service.com/TestResource",
+				Relations: map[string]*openfgav1.Userset{
+					"read": {
+						Userset: &openfgav1.Userset_Union{
+							Union: &openfgav1.Usersets{Child: []*openfgav1.Userset{c1, c2}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	model2 := &openfgav1.AuthorizationModel{
+		SchemaVersion: "1.2",
+		TypeDefinitions: []*openfgav1.TypeDefinition{
+			{
+				Type: "test.service.com/TestResource",
+				Relations: map[string]*openfgav1.Userset{
+					"read": {
+						Userset: &openfgav1.Userset_Union{
+							Union: &openfgav1.Usersets{Child: []*openfgav1.Userset{c2, c1}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assert.True(t, authorizationModelsEqual(model1, model2), "authorizationModelsEqual should treat reversed Userset union children as equal")
+}
+
