@@ -737,4 +737,3 @@ func TestAuthorizationModelsEqual_UsersetUnionChildOrdering(t *testing.T) {
 
 	assert.True(t, authorizationModelsEqual(model1, model2), "authorizationModelsEqual should treat reversed Userset union children as equal")
 }
-
