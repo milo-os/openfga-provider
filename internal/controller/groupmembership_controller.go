@@ -387,7 +387,7 @@ func (r *GroupMembershipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&iammiloapiscomv1alpha1.GroupMembership{}).
+		For(&iammiloapiscomv1alpha1.GroupMembership{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("groupmembership")
 
 	controllerBuilder.Watches(

@@ -805,7 +805,7 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&iamdatumapiscomv1alpha1.PolicyBinding{}).
+		For(&iamdatumapiscomv1alpha1.PolicyBinding{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("policybinding")
 
 	// Watch for changes to ProtectedResource CRs and enqueue PolicyBindings that might be affected.
