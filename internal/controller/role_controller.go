@@ -591,7 +591,7 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&iamdatumapiscomv1alpha1.Role{}).
+		For(&iamdatumapiscomv1alpha1.Role{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("role")
 
 	controllerBuilder.Watches(
