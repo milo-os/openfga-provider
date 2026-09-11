@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: controller-manager
+  labels:
+    app.kubernetes.io/name: controller-manager
+    app.kubernetes.io/part-of: auth-provider-openfga
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: controller-manager
+      app.kubernetes.io/part-of: auth-provider-openfga

@@ -1,15 +1,14 @@
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 
-# Production high-availability for the authz-webhook:
-#   - Scales to 3 replicas (HPA manages from there)
-#   - Spreads pods across nodes and zones
-#   - PodDisruptionBudget to survive node drains
-#   - HorizontalPodAutoscaler for load-based scaling
+# Production high-availability for auth-provider-openfga:
+#   - authz-webhook: 3 replicas, spread across nodes/zones, PDB, HPA
+#   - controller-manager: 2 replicas, spread across nodes (DoNotSchedule) and zones, PDB
 
 resources:
   - authz-webhook-pdb.yaml
   - authz-webhook-hpa.yaml
+  - controller-manager-pdb.yaml
 
 patches:
   - target:
@@ -35,4 +34,28 @@ patches:
             labelSelector:
               matchLabels:
                 app.kubernetes.io/name: authz-webhook
+                app.kubernetes.io/part-of: auth-provider-openfga
+  - target:
+      kind: Deployment
+      name: controller-manager
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 2
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: controller-manager
+                app.kubernetes.io/part-of: auth-provider-openfga
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: controller-manager
                 app.kubernetes.io/part-of: auth-provider-openfga
