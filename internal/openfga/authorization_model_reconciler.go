@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	corev1 "k8s.io/api/core/v1"
@@ -44,6 +45,29 @@ type AuthorizationModelReconciler struct {
 	ConfigMapName string
 }
 
+// protoSortKey returns an arbitrary but stable sort key for a protobuf message,
+// used to impose a deterministic order on repeated fields that carry set
+// semantics so that a reordering is not mistaken for a real change.
+//
+// Deterministic marshalling guarantees that equal messages serialize to equal
+// bytes within a binary, which is exactly what an ordering needs: protocmp
+// sorts both sides with this key before comparing, and cmpopts panics if the
+// ordering turns out not to be self-consistent. The prototext form
+// (fmt.Sprint, Message.String) is explicitly documented as unstable and
+// deliberately injects randomized whitespace, so it is not used here.
+//
+// The key is not canonical across languages or builds - never persist it or
+// compare it against a key produced by another process.
+func protoSortKey(m proto.Message) string {
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	if err != nil {
+		// Marshalling a well-formed proto3 message does not fail; fall back to a
+		// self-consistent key rather than collapsing every message to "".
+		return fmt.Sprint(m)
+	}
+	return string(b)
+}
+
 // getAuthorizationModelComparisonOptions returns the standardized cmp.Option slice for comparing authorization models
 // with options to ignore ordering differences and the OpenFGA-assigned id field
 func getAuthorizationModelComparisonOptions() []cmp.Option {
@@ -53,14 +77,15 @@ func getAuthorizationModelComparisonOptions() []cmp.Option {
 		protocmp.SortRepeated(func(a, b *openfgav1.TypeDefinition) bool {
 			return a.Type < b.Type
 		}),
+		// DirectlyRelatedUserTypes is a set. Sorting on type/relation alone
+		// leaves entries such as `user` and `user:*` incomparable, which makes
+		// a pure reordering of those look like a real change. Sorting on the
+		// full message covers the wildcard and condition fields too.
 		protocmp.SortRepeated(func(a, b *openfgav1.RelationReference) bool {
-			if a.Type != b.Type {
-				return a.Type < b.Type
-			}
-			return a.GetRelation() < b.GetRelation()
+			return protoSortKey(a) < protoSortKey(b)
 		}),
 		protocmp.SortRepeated(func(a, b *openfgav1.Userset) bool {
-			return fmt.Sprint(a) < fmt.Sprint(b)
+			return protoSortKey(a) < protoSortKey(b)
 		}),
 	}
 }
