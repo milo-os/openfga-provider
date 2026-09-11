@@ -737,3 +737,52 @@ func TestAuthorizationModelsEqual_UsersetUnionChildOrdering(t *testing.T) {
 
 	assert.True(t, authorizationModelsEqual(model1, model2), "authorizationModelsEqual should treat reversed Userset union children as equal")
 }
+
+// TestAuthorizationModelsEqual_ReorderedDirectlyRelatedUserTypes verifies that a
+// pure reordering of DirectlyRelatedUserTypes is not treated as a change, even
+// when two entries share the same type and differ only by wildcard or relation.
+// Sorting on type/relation alone left `user` and `user:*` incomparable, which
+// made the reordering look like a real diff and triggered a redundant write.
+func TestAuthorizationModelsEqual_ReorderedDirectlyRelatedUserTypes(t *testing.T) {
+	plainUser := &openfgav1.RelationReference{Type: "user"}
+	wildcardUser := &openfgav1.RelationReference{
+		Type:               "user",
+		RelationOrWildcard: &openfgav1.RelationReference_Wildcard{Wildcard: &openfgav1.Wildcard{}},
+	}
+	groupMember := &openfgav1.RelationReference{
+		Type:               "group",
+		RelationOrWildcard: &openfgav1.RelationReference_Relation{Relation: "member"},
+	}
+
+	model := func(refs ...*openfgav1.RelationReference) *openfgav1.AuthorizationModel {
+		return &openfgav1.AuthorizationModel{
+			SchemaVersion: "1.2",
+			TypeDefinitions: []*openfgav1.TypeDefinition{
+				{
+					Type: "test.service.com/TestResource",
+					Metadata: &openfgav1.Metadata{
+						Relations: map[string]*openfgav1.RelationMetadata{
+							"read": {DirectlyRelatedUserTypes: refs},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	assert.True(t,
+		authorizationModelsEqual(
+			model(plainUser, wildcardUser, groupMember),
+			model(groupMember, wildcardUser, plainUser),
+		),
+		"authorizationModelsEqual should treat reordered DirectlyRelatedUserTypes as equal",
+	)
+
+	assert.False(t,
+		authorizationModelsEqual(
+			model(plainUser, groupMember),
+			model(wildcardUser, groupMember),
+		),
+		"authorizationModelsEqual should distinguish a plain type reference from a wildcard one",
+	)
+}
