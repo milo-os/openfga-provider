@@ -517,10 +517,58 @@ func (r *PolicyBindingReconciler) updatePolicyBindingStatus(ctx context.Context,
 	return nil
 }
 
+// getSubjectResource fetches a PolicyBinding subject (User, Group, or ServiceAccount) as a typed object instead of
+// unstructured.Unstructured, which allows the read to go through the manager's cache instead of hitting the API
+// server live.
+func (r *PolicyBindingReconciler) getSubjectResource(
+	ctx context.Context,
+	apiGroup string,
+	kind string,
+	name string,
+	namespace string,
+) (client.Object, error) {
+	gk := schema.GroupKind{Group: apiGroup, Kind: kind}
+	mapping, mapErr := r.RESTMapper.RESTMapping(gk)
+	if mapErr != nil {
+		// Propagate error (e.g., meta.NoMatchError or other RESTMapper errors)
+		return nil, mapErr
+	}
+
+	key := client.ObjectKey{Name: name}
+	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+		if namespace == "" {
+			return nil, &MissingNamespaceError{GroupKind: gk, Name: name}
+		}
+		key.Namespace = namespace
+	}
+
+	var resource client.Object
+	switch kind {
+	case "User":
+		resource = &iamdatumapiscomv1alpha1.User{}
+	case "Group":
+		resource = &iamdatumapiscomv1alpha1.Group{}
+	case "ServiceAccount":
+		resource = &iamdatumapiscomv1alpha1.ServiceAccount{}
+	default:
+		// Falls back to the same "kind not recognized" signal the RESTMapper path
+		// above would produce, for any subject Kind outside the validated enum.
+		return nil, &meta.NoKindMatchError{GroupKind: gk}
+	}
+
+	if err := r.Get(ctx, key, resource); err != nil {
+		// Propagate error (e.g., apierrors.IsNotFound or other Get errors)
+		return nil, err
+	}
+
+	return resource, nil
+}
+
 // getUnstructuredResourceAndMapping is a helper function to resolve the GroupVersionKind (GVK) of a resource reference
 // and then fetch the resource as an unstructured.Unstructured object. It uses the RESTMapper to find the correct GVK
 // and determines if a namespace is required for the lookup. This function is used for validating the existence and
-// properties of both TargetRef and Subject resources.
+// properties of TargetRef resources, which — unlike Subjects — may be any Kind registered by any service's
+// ProtectedResource, not just the types compiled into this binary's scheme.
 func (r *PolicyBindingReconciler) getUnstructuredResourceAndMapping(
 	ctx context.Context,
 	apiGroup string,
@@ -613,7 +661,7 @@ func (r *PolicyBindingReconciler) validatePolicyBindingSubjects(ctx context.Cont
 			continue
 		}
 
-		fetchedSubject, err := r.getUnstructuredResourceAndMapping(ctx, iamdatumapiscomv1alpha1.SchemeGroupVersion.Group, subject.Kind, subject.Name, subject.Namespace)
+		fetchedSubject, err := r.getSubjectResource(ctx, iamdatumapiscomv1alpha1.SchemeGroupVersion.Group, subject.Kind, subject.Name, subject.Namespace)
 		if err != nil {
 			var subjectMsg string
 			var reason string
