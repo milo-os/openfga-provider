@@ -17,6 +17,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -220,6 +222,49 @@ func (r *AuthorizationModelReconciler) updateTriggeringPRStatus(
 	return nil
 }
 
+// protectedResourceEventPredicate skips reconciling ProtectedResource events
+// that don't need it: replayed Create events (e.g. on restart) are filtered
+// unless the model is stale, deletion is in progress, or the finalizer is
+// missing; Update events use the same check, since deletion starting or a
+// finalizer being stripped never bumps generation.
+func protectedResourceEventPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			pr, ok := e.Object.(*iamdatumapiscomv1alpha1.ProtectedResource)
+			if !ok {
+				return false
+			}
+
+			// Real creates must always be reconciled. Filter only objects
+			// replayed from the informer's initial list.
+			if !e.IsInInitialList {
+				return true
+			}
+
+			return pr.Status.ObservedGeneration != pr.Generation ||
+				pr.GetDeletionTimestamp() != nil ||
+				!controllerutil.ContainsFinalizer(pr, protectedResourceFinalizerKey)
+		},
+
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPR, oldOK := e.ObjectOld.(*iamdatumapiscomv1alpha1.ProtectedResource)
+			newPR, newOK := e.ObjectNew.(*iamdatumapiscomv1alpha1.ProtectedResource)
+			if !oldOK || !newOK {
+				return false
+			}
+
+			deletionStarted := oldPR.GetDeletionTimestamp() == nil &&
+				newPR.GetDeletionTimestamp() != nil
+			finalizerMissing := newPR.GetDeletionTimestamp() == nil &&
+				!controllerutil.ContainsFinalizer(newPR, protectedResourceFinalizerKey)
+
+			return oldPR.Generation != newPR.Generation ||
+				deletionStarted ||
+				finalizerMissing
+		},
+	}
+}
+
 // SetupWithManager configures the AuthorizationModelReconciler with the
 // provided controller manager. This involves setting up watches for
 // ProtectedResource custom resources, initializing the OpenFGA model builder if
@@ -259,7 +304,7 @@ func (r *AuthorizationModelReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&iamdatumapiscomv1alpha1.ProtectedResource{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&iamdatumapiscomv1alpha1.ProtectedResource{}, builder.WithPredicates(protectedResourceEventPredicate())).
 		Named("authorizationmodel_controller").
 		Complete(r)
 }
