@@ -7,7 +7,6 @@ import (
 	"hash/fnv"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/google/go-cmp/cmp"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -44,29 +43,6 @@ type AuthorizationModelReconciler struct {
 	// ConfigMapName is the name of the ConfigMap that stores the model ID.
 	// Defaults to DefaultAuthorizationModelConfigMapName if empty.
 	ConfigMapName string
-
-	mu                      sync.Mutex
-	lastReconciledSignature string
-}
-
-// InvalidateCache clears the cached input signature, forcing the next
-// reconciliation to query OpenFGA and re-verify the authorization model.
-func (r *AuthorizationModelReconciler) InvalidateCache() {
-	r.mu.Lock()
-	r.lastReconciledSignature = ""
-	r.mu.Unlock()
-}
-
-// computeProtectedResourcesSignature produces a stable deterministic fingerprint of
-// the given ProtectedResources based on their identity and spec generations.
-func computeProtectedResourcesSignature(prs []iamdatumapiscomv1alpha1.ProtectedResource) string {
-	keys := make([]string, 0, len(prs))
-	for _, pr := range prs {
-		deleted := pr.DeletionTimestamp != nil
-		keys = append(keys, fmt.Sprintf("%s/%s:%d:%t", pr.Namespace, pr.Name, pr.Generation, deleted))
-	}
-	sort.Strings(keys)
-	return strings.Join(keys, ",")
 }
 
 // protoSortKey returns an arbitrary but stable sort key for a protobuf message,
@@ -129,15 +105,6 @@ func authorizationModelsEqual(current, merged *openfgav1.AuthorizationModel) boo
 
 func (r *AuthorizationModelReconciler) ReconcileAuthorizationModel(ctx context.Context, protectedResources []iamdatumapiscomv1alpha1.ProtectedResource) error {
 	log := logf.FromContext(ctx).WithValues("component", "AuthorizationModelReconciler")
-
-	sig := computeProtectedResourcesSignature(protectedResources)
-	r.mu.Lock()
-	if r.lastReconciledSignature != "" && r.lastReconciledSignature == sig {
-		r.mu.Unlock()
-		log.V(1).Info("Authorization model inputs unchanged since last reconciliation, skipping redundant check")
-		return nil
-	}
-	r.mu.Unlock()
 
 	currentAuthorizationModel, err := r.getCurrentAuthorizationModel(ctx)
 	if err != nil {
@@ -207,9 +174,6 @@ func (r *AuthorizationModelReconciler) ReconcileAuthorizationModel(ctx context.C
 					"model_id", currentAuthorizationModel.GetId())
 			}
 		}
-		r.mu.Lock()
-		r.lastReconciledSignature = sig
-		r.mu.Unlock()
 		return nil
 	}
 
@@ -237,10 +201,6 @@ func (r *AuthorizationModelReconciler) ReconcileAuthorizationModel(ctx context.C
 				"model_id", writeResp.GetAuthorizationModelId())
 		}
 	}
-
-	r.mu.Lock()
-	r.lastReconciledSignature = sig
-	r.mu.Unlock()
 
 	return nil
 }

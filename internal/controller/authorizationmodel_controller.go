@@ -148,6 +148,13 @@ func (r *AuthorizationModelReconciler) Reconcile(ctx context.Context, req ctrl.R
 // the OpenFGA store.
 func (r *AuthorizationModelReconciler) reconcileProtectedResource(ctx context.Context, triggeringPR *iamdatumapiscomv1alpha1.ProtectedResource) (ctrl.Result, error) {
 	log := logf.FromContext(ctx).WithValues("protectedResourceName", triggeringPR.Name, "operation", "reconcileProtectedResource")
+
+	// Already reconciled at this generation
+	if triggeringPR.Status.ObservedGeneration == triggeringPR.Generation {
+		log.V(1).Info("ProtectedResource already observed at current generation, skipping authorization model reconciliation")
+		return ctrl.Result{}, nil
+	}
+
 	log.Info("Proceeding with regular reconciliation")
 
 	// Capture the old status before making any changes
