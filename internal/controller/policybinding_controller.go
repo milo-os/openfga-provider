@@ -814,31 +814,25 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 		return []reconcile.Request{}
 	}
 
-	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	roleKey := openfga.RoleRefIndexKey(changedRole.Namespace, iamdatumapiscomv1alpha1.RoleReference{
-		Name:      changedRole.Name,
-		Namespace: changedRole.Namespace,
-	})
-	if err := r.List(ctx, policyBindings, client.MatchingFields{
-		openfga.RoleRefIndexField: roleKey,
-	}); err != nil {
-		log.Error(err, "failed to list PolicyBindings for Role change", "roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
-		return []reconcile.Request{}
-	}
-
-	requests := make([]reconcile.Request, 0, len(policyBindings.Items))
-	for _, pb := range policyBindings.Items {
-		// Resolve the bound Role. An empty RoleRef.Namespace defaults to the
-		// PolicyBinding's namespace.
-		roleNamespace := pb.Spec.RoleRef.Namespace
-		if roleNamespace == "" {
-			roleNamespace = pb.Namespace
+	// Look up PolicyBindings bound to any of the affected Roles (the changed
+	// Role plus every Role that transitively inherits it) via the roleRef
+	// index, one query per affected Role. A binding can only match one
+	// affected Role's key, so no de-duplication is needed across queries.
+	requests := make([]reconcile.Request, 0)
+	for boundRole := range affectedRoles {
+		roleKey := openfga.RoleRefIndexKey(boundRole.Namespace, iamdatumapiscomv1alpha1.RoleReference{
+			Name:      boundRole.Name,
+			Namespace: boundRole.Namespace,
+		})
+		policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
+		if err := r.List(ctx, policyBindings, client.MatchingFields{
+			openfga.RoleRefIndexField: roleKey,
+		}); err != nil {
+			log.Error(err, "failed to list PolicyBindings for Role change", "roleName", boundRole.Name, "roleNamespace", boundRole.Namespace)
+			continue
 		}
-		boundRole := client.ObjectKey{Namespace: roleNamespace, Name: pb.Spec.RoleRef.Name}
 
-		// Re-evaluate the binding if its bound Role is the changed Role or
-		// transitively inherits it.
-		if _, ok := affectedRoles[boundRole]; ok {
+		for _, pb := range policyBindings.Items {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      pb.Name,
@@ -891,11 +885,13 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
-	// Watch for changes to Role CRs and enqueue PolicyBindings that might be affected.
+	// Watch Role changes, unfiltered: a status-only update (e.g. effective
+	// permissions recomputed after an ancestor Role change) doesn't bump
+	// generation, but still needs to re-trigger a bound PolicyBinding's
+	// tuple re-bake.
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.Role{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueuePolicyBindingsForRoleChange),
-		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	return controllerBuilder.WithOptions(controller.Options{
