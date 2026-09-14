@@ -18,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -27,6 +28,15 @@ import (
 
 const (
 	roleFinalizerKey = "iam.miloapis.com/openfga-role"
+
+	// defaultRoleMaxConcurrentReconciles allows the controller to drain a large
+	// initial Role queue (e.g. on a fresh install or controller restart)
+	// concurrently instead of one at a time. OpenFGA reconciliation for Role is
+	// currently a no-op (permissions are inlined into PolicyBinding tuples at
+	// bind time), and each reconcile otherwise only reads and writes its own
+	// Role's status, so concurrent reconciles of different Roles don't share
+	// state.
+	defaultRoleMaxConcurrentReconciles = 20
 )
 
 // parsePermissionString splits a permission string into its components.
@@ -80,6 +90,16 @@ type RoleReconciler struct {
 	StoreID       string
 	Finalizers    finalizer.Finalizers
 	EventRecorder record.EventRecorder
+	// MaxConcurrentReconciles controls Role reconcile parallelism. When zero,
+	// defaultRoleMaxConcurrentReconciles is used.
+	MaxConcurrentReconciles int
+}
+
+func (r *RoleReconciler) maxConcurrentReconciles() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return defaultRoleMaxConcurrentReconciles
 }
 
 // unresolvedInheritedRole identifies an inheritedRoles reference that could not
@@ -591,7 +611,7 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&iamdatumapiscomv1alpha1.Role{}).
+		For(&iamdatumapiscomv1alpha1.Role{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("role")
 
 	controllerBuilder.Watches(
@@ -609,7 +629,11 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
-	return controllerBuilder.Complete(r)
+	return controllerBuilder.
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+		}).
+		Complete(r)
 }
 
 // +kubebuilder:rbac:groups=iam.miloapis.com,resources=roles,verbs=get;list;watch;create;update;patch;delete

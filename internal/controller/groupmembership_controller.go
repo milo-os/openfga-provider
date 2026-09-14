@@ -17,6 +17,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -28,6 +29,26 @@ const (
 
 	ConditionTypeUserRefValid  = "UserRefValid"
 	ConditionTypeGroupRefValid = "GroupRefValid"
+
+	// groupMembershipUserRefIndexField indexes GroupMemberships by
+	// spec.userRef.name, so a User change can look up affected GroupMemberships
+	// directly instead of listing and filtering every GroupMembership in the
+	// cluster.
+	groupMembershipUserRefIndexField = "groupmembership.userRef.name"
+
+	// groupMembershipGroupRefIndexField indexes GroupMemberships by
+	// "<groupRef.namespace>/<groupRef.name>", for the same reason on Group
+	// changes. It only indexes GroupMemberships whose own namespace matches
+	// their GroupRef's namespace, preserving the existing (InNamespace +
+	// equality-filter) behavior this replaces.
+	groupMembershipGroupRefIndexField = "groupmembership.groupRef"
+
+	// defaultGroupMembershipMaxConcurrentReconciles allows the controller to
+	// drain a large initial GroupMembership queue (e.g. on a fresh install or
+	// controller restart) concurrently instead of one at a time. Each
+	// reconcile writes tuples scoped to its own (User, Group) pair, so
+	// concurrent reconciles of different GroupMemberships don't share state.
+	defaultGroupMembershipMaxConcurrentReconciles = 20
 )
 
 // GroupMembershipReconciler reconciles a GroupMembership object
@@ -39,6 +60,16 @@ type GroupMembershipReconciler struct {
 	Finalizers          finalizer.Finalizers
 	EventRecorder       record.EventRecorder
 	UserGroupReconciler *openfga.UserGroupReconciler
+	// MaxConcurrentReconciles controls GroupMembership reconcile parallelism.
+	// When zero, defaultGroupMembershipMaxConcurrentReconciles is used.
+	MaxConcurrentReconciles int
+}
+
+func (r *GroupMembershipReconciler) maxConcurrentReconciles() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return defaultGroupMembershipMaxConcurrentReconciles
 }
 
 // UserGroupFinalizer implements the finalizer.Finalizer interface for GroupMembership cleanup.
@@ -277,97 +308,59 @@ func (r *GroupMembershipReconciler) validateRef(
 	return true, nil
 }
 
-// GroupMembershipChangeRequest contains the parameters for enqueuing GroupMemberships for changes
-type GroupMembershipChangeRequest struct {
-	Ctx          context.Context
-	Obj          client.Object
-	ResourceType string
-	FieldName    string
-	Namespace    string
-}
+// enqueueGroupMembershipsForUserChange returns GroupMembership requests that reference the changed User, using the
+// groupMembershipUserRefIndexField index instead of listing and filtering every GroupMembership in the cluster.
+func (r *GroupMembershipReconciler) enqueueGroupMembershipsForUserChange(ctx context.Context, obj client.Object) []ctrl.Request {
+	log := logf.FromContext(ctx)
 
-// enqueueGroupMembershipsForChange is a helper function that returns GroupMembership requests for resource changes
-func (r *GroupMembershipReconciler) enqueueGroupMembershipsForChange(req GroupMembershipChangeRequest) []ctrl.Request {
-	log := logf.FromContext(req.Ctx)
-
-	log.Info("Enqueuing GroupMemberships for resource change", "resourceType", req.ResourceType, "fieldName", req.FieldName)
-
-	_, ok := req.Obj.(metav1.Object)
+	user, ok := obj.(*iammiloapiscomv1alpha1.User)
 	if !ok {
-		log.Error(fmt.Errorf("object is not a metav1.Object"), "failed to get metadata")
+		log.Error(fmt.Errorf("expected a User but got a %T", obj), "failed to get User from object")
 		return nil
 	}
 
 	var groupMembershipList iammiloapiscomv1alpha1.GroupMembershipList
-	if err := r.List(req.Ctx, &groupMembershipList, client.InNamespace(req.Namespace)); err != nil {
-		log.Error(err, "failed to list GroupMemberships")
+	if err := r.List(ctx, &groupMembershipList, client.MatchingFields{groupMembershipUserRefIndexField: user.Name}); err != nil {
+		log.Error(err, "failed to list GroupMemberships by userRef index")
 		return nil
 	}
 
-	log.Info("Processing GroupMemberships for resource change", "resourceType", req.ResourceType, "totalGroupMemberships", len(groupMembershipList.Items))
-
-	var requests []ctrl.Request
-	switch req.ResourceType {
-	case "user":
-		user, ok := req.Obj.(*iammiloapiscomv1alpha1.User)
-		if !ok {
-			log.Error(fmt.Errorf("expected a User but got a %T", req.Obj), "failed to get User from object")
-			return nil
-		}
-		for _, groupMembership := range groupMembershipList.Items {
-			if groupMembership.Spec.UserRef.Name == user.Name {
-				requests = append(requests, ctrl.Request{
-					NamespacedName: client.ObjectKey{
-						Name:      groupMembership.Name,
-						Namespace: groupMembership.Namespace,
-					},
-				})
-			}
-		}
-		log.Info("Requeuing GroupMemberships", "resourceType", req.ResourceType, "name", user.Name, "field", req.FieldName, "requestCount", len(requests))
-
-	case "group":
-		group, ok := req.Obj.(*iammiloapiscomv1alpha1.Group)
-		if !ok {
-			log.Error(fmt.Errorf("expected a Group but got a %T", req.Obj), "failed to get Group from object")
-			return nil
-		}
-		for _, groupMembership := range groupMembershipList.Items {
-			if groupMembership.Spec.GroupRef.Name == group.Name && groupMembership.Spec.GroupRef.Namespace == group.Namespace {
-				requests = append(requests, ctrl.Request{
-					NamespacedName: client.ObjectKey{
-						Name:      groupMembership.Name,
-						Namespace: groupMembership.Namespace,
-					},
-				})
-			}
-		}
-		log.Info("Requeuing GroupMemberships", "resourceType", req.ResourceType, "name", fmt.Sprintf("%s/%s", group.Namespace, group.Name), "field", req.FieldName, "requestCount", len(requests))
+	requests := make([]ctrl.Request, 0, len(groupMembershipList.Items))
+	for _, groupMembership := range groupMembershipList.Items {
+		requests = append(requests, ctrl.Request{
+			NamespacedName: client.ObjectKey{Name: groupMembership.Name, Namespace: groupMembership.Namespace},
+		})
 	}
-
+	log.Info("Requeuing GroupMemberships", "resourceType", "user", "name", user.Name, "requestCount", len(requests))
 	return requests
 }
 
-// enqueueGroupMembershipsForUserChange returns GroupMembership requests that reference the changed User
-func (r *GroupMembershipReconciler) enqueueGroupMembershipsForUserChange(ctx context.Context, obj client.Object) []ctrl.Request {
-	return r.enqueueGroupMembershipsForChange(GroupMembershipChangeRequest{
-		Ctx:          ctx,
-		Obj:          obj,
-		ResourceType: "user",
-		FieldName:    "userRef",
-		Namespace:    "", // "" means all namespaces
-	})
-}
-
-// enqueueGroupMembershipsForGroupChange returns GroupMembership requests that reference the changed Group
+// enqueueGroupMembershipsForGroupChange returns GroupMembership requests that reference the changed Group, using the
+// groupMembershipGroupRefIndexField index instead of listing and filtering every GroupMembership in the cluster.
 func (r *GroupMembershipReconciler) enqueueGroupMembershipsForGroupChange(ctx context.Context, obj client.Object) []ctrl.Request {
-	return r.enqueueGroupMembershipsForChange(GroupMembershipChangeRequest{
-		Ctx:          ctx,
-		Obj:          obj,
-		ResourceType: "group",
-		FieldName:    "groupRef",
-		Namespace:    obj.GetNamespace(),
-	})
+	log := logf.FromContext(ctx)
+
+	group, ok := obj.(*iammiloapiscomv1alpha1.Group)
+	if !ok {
+		log.Error(fmt.Errorf("expected a Group but got a %T", obj), "failed to get Group from object")
+		return nil
+	}
+
+	key := group.Namespace + "/" + group.Name
+	var groupMembershipList iammiloapiscomv1alpha1.GroupMembershipList
+	if err := r.List(ctx, &groupMembershipList, client.MatchingFields{groupMembershipGroupRefIndexField: key}); err != nil {
+		log.Error(err, "failed to list GroupMemberships by groupRef index")
+		return nil
+	}
+
+	requests := make([]ctrl.Request, 0, len(groupMembershipList.Items))
+	for _, groupMembership := range groupMembershipList.Items {
+		requests = append(requests, ctrl.Request{
+			NamespacedName: client.ObjectKey{Name: groupMembership.Name, Namespace: groupMembership.Namespace},
+		})
+	}
+	log.Info("Requeuing GroupMemberships", "resourceType", "group", "name", key, "requestCount", len(requests))
+	return requests
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -386,8 +379,31 @@ func (r *GroupMembershipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed to register group membership finalizer: %w", err)
 	}
 
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iammiloapiscomv1alpha1.GroupMembership{}, groupMembershipUserRefIndexField, func(rawObj client.Object) []string {
+		groupMembership, ok := rawObj.(*iammiloapiscomv1alpha1.GroupMembership)
+		if !ok {
+			return nil
+		}
+		return []string{groupMembership.Spec.UserRef.Name}
+	}); err != nil {
+		return fmt.Errorf("index GroupMembership userRef: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iammiloapiscomv1alpha1.GroupMembership{}, groupMembershipGroupRefIndexField, func(rawObj client.Object) []string {
+		groupMembership, ok := rawObj.(*iammiloapiscomv1alpha1.GroupMembership)
+		if !ok {
+			return nil
+		}
+		if groupMembership.Namespace != groupMembership.Spec.GroupRef.Namespace {
+			return nil
+		}
+		return []string{groupMembership.Spec.GroupRef.Namespace + "/" + groupMembership.Spec.GroupRef.Name}
+	}); err != nil {
+		return fmt.Errorf("index GroupMembership groupRef: %w", err)
+	}
+
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&iammiloapiscomv1alpha1.GroupMembership{}).
+		For(&iammiloapiscomv1alpha1.GroupMembership{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("groupmembership")
 
 	controllerBuilder.Watches(
@@ -402,5 +418,9 @@ func (r *GroupMembershipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
-	return controllerBuilder.Complete(r)
+	return controllerBuilder.
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+		}).
+		Complete(r)
 }
