@@ -190,9 +190,11 @@ func (r *PolicyReconciler) siblingDesiredTuples(
 	targetObject string,
 	validPerms map[string]struct{},
 ) ([]*openfgav1.TupleKey, error) {
-	var allBindings iamdatumapiscomv1alpha1.PolicyBindingList
-	if err := r.K8sClient.List(ctx, &allBindings); err != nil {
-		return nil, fmt.Errorf("failed to list PolicyBindings: %w", err)
+	var siblingBindings iamdatumapiscomv1alpha1.PolicyBindingList
+	if err := r.K8sClient.List(ctx, &siblingBindings, client.MatchingFields{
+		TargetObjectIndexField: targetObject,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list sibling PolicyBindings: %w", err)
 	}
 
 	triggerSubjects := make(map[string]struct{})
@@ -201,17 +203,11 @@ func (r *PolicyReconciler) siblingDesiredTuples(
 	}
 
 	var desired []*openfgav1.TupleKey
-	for i := range allBindings.Items {
-		other := allBindings.Items[i]
+	for i := range siblingBindings.Items {
+		other := siblingBindings.Items[i]
 
 		// Skip the binding itself.
 		if other.Namespace == binding.Namespace && other.Name == binding.Name {
-			continue
-		}
-
-		// Must target the same resource object.
-		otherTarget, err := r.getTargetObjectFromResourceSelector(other.Spec.ResourceSelector)
-		if err != nil || otherTarget != targetObject {
 			continue
 		}
 
@@ -407,19 +403,7 @@ func (r *PolicyReconciler) getExistingTuples(
 
 // getTargetObjectFromResourceSelector extracts the target object identifier from ResourceSelector
 func (r *PolicyReconciler) getTargetObjectFromResourceSelector(selector iamdatumapiscomv1alpha1.ResourceSelector) (string, error) {
-	if selector.ResourceRef != nil {
-		// For specific resource instances: apiGroup/Kind:name
-		return fmt.Sprintf("%s/%s:%s", selector.ResourceRef.APIGroup, selector.ResourceRef.Kind, selector.ResourceRef.Name), nil
-	}
-
-	if selector.ResourceKind != nil {
-		// For all instances of a resource kind the permission model
-		// targets the kind-level root object in the same format as a specific
-		// instance but using the TypeRoot prefix.
-		return fmt.Sprintf("%s:%s/%s", TypeRoot, selector.ResourceKind.APIGroup, selector.ResourceKind.Kind), nil
-	}
-
-	return "", fmt.Errorf("resourceSelector must specify either resourceRef or resourceKind")
+	return TargetObjectFromResourceSelector(selector)
 }
 
 func convertTuplesForDelete(tuples []*openfgav1.TupleKey) []*openfgav1.TupleKeyWithoutCondition {

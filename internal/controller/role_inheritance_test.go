@@ -6,18 +6,10 @@ import (
 	"testing"
 
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
-
-func role(namespace, name string, inherited ...iamdatumapiscomv1alpha1.ScopedRoleReference) *iamdatumapiscomv1alpha1.Role {
-	return &iamdatumapiscomv1alpha1.Role{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Spec:       iamdatumapiscomv1alpha1.RoleSpec{InheritedRoles: inherited},
-	}
-}
 
 func inherits(name, namespace string) iamdatumapiscomv1alpha1.ScopedRoleReference {
 	return iamdatumapiscomv1alpha1.ScopedRoleReference{Name: name, Namespace: namespace}
@@ -48,9 +40,9 @@ func TestRolesDependentOnRole(t *testing.T) {
 			name: "transitive chain across namespaces resolves full closure",
 			roles: []*iamdatumapiscomv1alpha1.Role{
 				// viewer (datum-cloud) -> networking-viewer (milo-system) -> gateway-viewer (milo-system)
-				role("datum-cloud", "viewer", inherits("networking-viewer", "milo-system")),
-				role("milo-system", "networking-viewer", inherits("gateway-viewer", "")),
-				role("milo-system", "gateway-viewer"),
+				role("datum-cloud", "viewer", nil, inherits("networking-viewer", "milo-system")),
+				role("milo-system", "networking-viewer", nil, inherits("gateway-viewer", "")),
+				role("milo-system", "gateway-viewer", nil),
 			},
 			changed: client.ObjectKey{Namespace: "milo-system", Name: "gateway-viewer"},
 			want: []string{
@@ -62,10 +54,10 @@ func TestRolesDependentOnRole(t *testing.T) {
 		{
 			name: "empty inherited namespace defaults to the referencing role namespace",
 			roles: []*iamdatumapiscomv1alpha1.Role{
-				role("ns-a", "child", inherits("parent", "")),
-				role("ns-a", "parent"),
+				role("ns-a", "child", nil, inherits("parent", "")),
+				role("ns-a", "parent", nil),
 				// Same-named parent in another namespace must NOT be matched.
-				role("ns-b", "parent"),
+				role("ns-b", "parent", nil),
 			},
 			changed: client.ObjectKey{Namespace: "ns-a", Name: "parent"},
 			want:    []string{"ns-a/child", "ns-a/parent"},
@@ -73,8 +65,8 @@ func TestRolesDependentOnRole(t *testing.T) {
 		{
 			name: "cycle does not loop forever",
 			roles: []*iamdatumapiscomv1alpha1.Role{
-				role("ns", "a", inherits("b", "ns")),
-				role("ns", "b", inherits("a", "ns")),
+				role("ns", "a", nil, inherits("b", "ns")),
+				role("ns", "b", nil, inherits("a", "ns")),
 			},
 			changed: client.ObjectKey{Namespace: "ns", Name: "a"},
 			want:    []string{"ns/a", "ns/b"},
@@ -82,8 +74,8 @@ func TestRolesDependentOnRole(t *testing.T) {
 		{
 			name: "role with no dependents returns only itself",
 			roles: []*iamdatumapiscomv1alpha1.Role{
-				role("ns", "lonely"),
-				role("ns", "unrelated", inherits("something-else", "ns")),
+				role("ns", "lonely", nil),
+				role("ns", "unrelated", nil, inherits("something-else", "ns")),
 			},
 			changed: client.ObjectKey{Namespace: "ns", Name: "lonely"},
 			want:    []string{"ns/lonely"},
@@ -91,10 +83,10 @@ func TestRolesDependentOnRole(t *testing.T) {
 		{
 			name: "diamond inheritance is de-duplicated",
 			roles: []*iamdatumapiscomv1alpha1.Role{
-				role("ns", "top"),
-				role("ns", "left", inherits("top", "ns")),
-				role("ns", "right", inherits("top", "ns")),
-				role("ns", "bottom", inherits("left", "ns"), inherits("right", "ns")),
+				role("ns", "top", nil),
+				role("ns", "left", nil, inherits("top", "ns")),
+				role("ns", "right", nil, inherits("top", "ns")),
+				role("ns", "bottom", nil, inherits("left", "ns"), inherits("right", "ns")),
 			},
 			changed: client.ObjectKey{Namespace: "ns", Name: "top"},
 			want:    []string{"ns/bottom", "ns/left", "ns/right", "ns/top"},

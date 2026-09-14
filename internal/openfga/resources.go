@@ -2,6 +2,7 @@ package openfga
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
@@ -121,9 +122,10 @@ func getResourceGraph(protectedResources []iamdatumapiscomv1alpha1.ProtectedReso
 			}
 		}
 	}
-	// Note: The original check for `len(rootResources) == 0` was removed.
-	// The graph will always have TypeRoot.
-	// If `rootResourceIdentifiers` is empty, `nodes` will be empty, which is fine.
+	sort.Strings(rootResourceIdentifiers)
+	for parent := range directChildren {
+		sort.Strings(directChildren[parent])
+	}
 
 	nodes := []*resourceGraphNode{}
 	processedRootNodes := make(map[string]bool) // To avoid processing the same root node multiple times if listed
@@ -206,6 +208,7 @@ func getResourceGraphNode(
 		}
 		node.ParentResources = append(node.ParentResources, pr.APIGroup+"/"+pr.Kind)
 	}
+	sort.Strings(node.ParentResources)
 
 	resourceTypeParts := strings.Split(fqResourceType, "/")
 	if len(resourceTypeParts) != 2 {
@@ -220,6 +223,7 @@ func getResourceGraphNode(
 		}
 		node.DirectPermissions = append(node.DirectPermissions, fmt.Sprintf("%s/%s.%s", serviceSpecificAPIGroupFromFQN, resourceSpec.Plural, permission))
 	}
+	sort.Strings(node.DirectPermissions)
 
 	return node, nil
 }

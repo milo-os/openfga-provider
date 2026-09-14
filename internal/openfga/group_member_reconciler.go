@@ -34,7 +34,7 @@ func (r *UserGroupReconciler) AddMemberToGroup(ctx context.Context, joinToGroupR
 
 	checkResp, err := r.checkIfTupleKeyExists(ctx, tupleKeys[0])
 	if err != nil {
-		return fmt.Errorf("f ailed to check if GroupMember tuple key exists: %w", err)
+		return fmt.Errorf("failed to check if GroupMember tuple key exists: %w", err)
 	}
 
 	// If the tuple key does not exist, write it to the OpenFGA store
@@ -47,6 +47,10 @@ func (r *UserGroupReconciler) AddMemberToGroup(ctx context.Context, joinToGroupR
 		}
 		_, err = r.Client.Write(ctx, writeRequest)
 		if err != nil {
+			// Check above can be racy; already-exists means the tuple is there, so treat as success.
+			if IsAlreadyExistsErr(err) {
+				return nil
+			}
 			return fmt.Errorf("failed to write group membership tuple: %w", err)
 		}
 	}
@@ -81,7 +85,11 @@ func (r *UserGroupReconciler) RemoveMemberFromGroup(ctx context.Context, groupMe
 			Deletes: deleteRequest,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to delete group membership : %w", err)
+			// Check above can be racy; not-found means the tuple is gone, so treat as success.
+			if IsTupleNotFoundErr(err) {
+				return nil
+			}
+			return fmt.Errorf("failed to delete group membership: %w", err)
 		}
 	}
 

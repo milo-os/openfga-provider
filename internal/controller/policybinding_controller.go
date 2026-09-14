@@ -22,15 +22,21 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
 	policyBindingFinalizerKey = "iam.miloapis.com/policybinding"
+	// defaultPolicyBindingMaxConcurrentReconciles allows the controller to drain
+	// the workqueue faster on clusters with many PolicyBindings.
+	defaultPolicyBindingMaxConcurrentReconciles = 8
 	// ConditionTypeSubjectValid represents the condition type for validating the subjects (users or groups) referenced in
 	// a PolicyBinding. This condition is True if all subjects are found, recognized by the API server, and have valid
 	// UIDs.
@@ -48,6 +54,10 @@ const (
 	// ReasonValidationFailed indicates that a validation check has failed, detailing why the resource or reference is not
 	// considered valid.
 	ReasonValidationFailed = "ValidationFailed"
+
+	// protectedResourceServiceKindIndexField indexes ProtectedResources by
+	// "<serviceRef.name>/<kind>"
+	protectedResourceServiceKindIndexField = "protectedresource.serviceKind"
 )
 
 // MissingNamespaceError is an error type used to indicate that a namespace was expected for a given Kubernetes resource
@@ -83,6 +93,9 @@ type PolicyBindingReconciler struct {
 	StoreID       string
 	Finalizers    finalizer.Finalizers
 	EventRecorder record.EventRecorder
+	// MaxConcurrentReconciles controls PolicyBinding reconcile parallelism.
+	// When zero, defaultPolicyBindingMaxConcurrentReconciles is used.
+	MaxConcurrentReconciles int
 }
 
 // Reconcile is the core reconciliation loop for PolicyBinding resources. It is called by the controller-runtime when a
@@ -184,6 +197,7 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after successful validations before OpenFGA reconciliation: %w", err)
 	}
+	oldStatus = policyBinding.Status.DeepCopy()
 
 	// Reconcile with OpenFGA. This creates/updates/deletes tuples in OpenFGA based on the PolicyBinding. This step also
 	// implicitly validates the RoleRef by attempting to use the role.
@@ -213,29 +227,26 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // For ResourceRef, it validates the specific resource instance exists and matches the UID.
 // For ResourceKind, it validates that the resource type is registered in ProtectedResources.
 func (r *PolicyBindingReconciler) reconcileResourceSelectorValidation(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
-	// Fetch all ProtectedResource CRs. These define the resource types managed by IAM.
-	var protectedResourceList iamdatumapiscomv1alpha1.ProtectedResourceList
-	if err := r.List(ctx, &protectedResourceList); err != nil {
-		return false, fmt.Errorf("failed to list ProtectedResources: %w", err)
-	}
-
 	if policyBinding.Spec.ResourceSelector.ResourceRef != nil {
-		return r.validateResourceRef(ctx, policyBinding, protectedResourceList.Items, oldStatus, currentGeneration)
+		return r.validateResourceRef(ctx, policyBinding, oldStatus, currentGeneration)
 	} else if policyBinding.Spec.ResourceSelector.ResourceKind != nil {
-		return r.validateResourceKind(ctx, policyBinding, protectedResourceList.Items, oldStatus, currentGeneration)
+		return r.validateResourceKind(ctx, policyBinding, oldStatus, currentGeneration)
 	} else {
 		return false, fmt.Errorf("ResourceSelector is empty")
 	}
 }
 
 // validateResourceRef validates a specific resource instance referenced by ResourceRef
-func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, protectedResources []iamdatumapiscomv1alpha1.ProtectedResource, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
+func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
 	log := logf.FromContext(ctx)
 
 	resourceRef := policyBinding.Spec.ResourceSelector.ResourceRef
 
 	// Validate if the target type specified in the PolicyBinding is registered by any ProtectedResource.
-	isKnownType, typeValidationReason := r.validateResourceType(resourceRef.APIGroup, resourceRef.Kind, protectedResources)
+	isKnownType, typeValidationReason, err := r.validateResourceType(ctx, resourceRef.APIGroup, resourceRef.Kind)
+	if err != nil {
+		return false, err
+	}
 	if !isKnownType {
 		meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
 			Type:   ConditionTypeTargetValid,
@@ -326,13 +337,16 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 }
 
 // validateResourceKind validates a resource kind for system-wide access
-func (r *PolicyBindingReconciler) validateResourceKind(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, protectedResources []iamdatumapiscomv1alpha1.ProtectedResource, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
+func (r *PolicyBindingReconciler) validateResourceKind(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
 	log := logf.FromContext(ctx)
 
 	resourceKind := policyBinding.Spec.ResourceSelector.ResourceKind
 
 	// Validate if the resource kind is registered by any ProtectedResource.
-	isKnownType, typeValidationReason := r.validateResourceType(resourceKind.APIGroup, resourceKind.Kind, protectedResources)
+	isKnownType, typeValidationReason, err := r.validateResourceType(ctx, resourceKind.APIGroup, resourceKind.Kind)
+	if err != nil {
+		return false, err
+	}
 	if !isKnownType {
 		meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
 			Type:   ConditionTypeTargetValid,
@@ -507,10 +521,58 @@ func (r *PolicyBindingReconciler) updatePolicyBindingStatus(ctx context.Context,
 	return nil
 }
 
+// getSubjectResource fetches a PolicyBinding subject (User, Group, or ServiceAccount) as a typed object instead of
+// unstructured.Unstructured, which allows the read to go through the manager's cache instead of hitting the API
+// server live.
+func (r *PolicyBindingReconciler) getSubjectResource(
+	ctx context.Context,
+	apiGroup string,
+	kind string,
+	name string,
+	namespace string,
+) (client.Object, error) {
+	gk := schema.GroupKind{Group: apiGroup, Kind: kind}
+	mapping, mapErr := r.RESTMapper.RESTMapping(gk)
+	if mapErr != nil {
+		// Propagate error (e.g., meta.NoMatchError or other RESTMapper errors)
+		return nil, mapErr
+	}
+
+	key := client.ObjectKey{Name: name}
+	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+		if namespace == "" {
+			return nil, &MissingNamespaceError{GroupKind: gk, Name: name}
+		}
+		key.Namespace = namespace
+	}
+
+	var resource client.Object
+	switch kind {
+	case "User":
+		resource = &iamdatumapiscomv1alpha1.User{}
+	case "Group":
+		resource = &iamdatumapiscomv1alpha1.Group{}
+	case "ServiceAccount":
+		resource = &iamdatumapiscomv1alpha1.ServiceAccount{}
+	default:
+		// Falls back to the same "kind not recognized" signal the RESTMapper path
+		// above would produce, for any subject Kind outside the validated enum.
+		return nil, &meta.NoKindMatchError{GroupKind: gk}
+	}
+
+	if err := r.Get(ctx, key, resource); err != nil {
+		// Propagate error (e.g., apierrors.IsNotFound or other Get errors)
+		return nil, err
+	}
+
+	return resource, nil
+}
+
 // getUnstructuredResourceAndMapping is a helper function to resolve the GroupVersionKind (GVK) of a resource reference
 // and then fetch the resource as an unstructured.Unstructured object. It uses the RESTMapper to find the correct GVK
 // and determines if a namespace is required for the lookup. This function is used for validating the existence and
-// properties of both TargetRef and Subject resources.
+// properties of TargetRef resources, which — unlike Subjects — may be any Kind registered by any service's
+// ProtectedResource, not just the types compiled into this binary's scheme.
 func (r *PolicyBindingReconciler) getUnstructuredResourceAndMapping(
 	ctx context.Context,
 	apiGroup string,
@@ -549,29 +611,28 @@ func (r *PolicyBindingReconciler) getUnstructuredResourceAndMapping(
 
 // validateResourceType checks if the resource type (APIGroup/Kind) is declared by any of the provided ProtectedResources.
 func (r *PolicyBindingReconciler) validateResourceType(
+	ctx context.Context,
 	apiGroup string,
 	kind string,
-	protectedResources []iamdatumapiscomv1alpha1.ProtectedResource,
-) (isValid bool, reason string) {
+) (isValid bool, reason string, err error) {
 	if apiGroup == "" || kind == "" {
-		return false, "APIGroup or Kind is empty."
+		return false, "APIGroup or Kind is empty.", nil
 	}
 
-	foundMatchingProtectedResource := false
-	for _, pr := range protectedResources {
-		// A ProtectedResource defines a specific kind within a service. The
-		// ServiceRef.Name is the APIGroup of the ProtectedResource.
-		if pr.Spec.ServiceRef.Name == apiGroup && pr.Spec.Kind == kind {
-			foundMatchingProtectedResource = true
-			break
-		}
+	// A ProtectedResource defines a specific kind within a service. The
+	// ServiceRef.Name is the APIGroup of the ProtectedResource.
+	var protectedResourceList iamdatumapiscomv1alpha1.ProtectedResourceList
+	if err := r.List(ctx, &protectedResourceList, client.MatchingFields{
+		protectedResourceServiceKindIndexField: apiGroup + "/" + kind,
+	}); err != nil {
+		return false, "", fmt.Errorf("failed to list ProtectedResources by service/kind index: %w", err)
 	}
 
-	if !foundMatchingProtectedResource {
-		return false, fmt.Sprintf("No ProtectedResource found defining type '%s/%s'.", apiGroup, kind)
+	if len(protectedResourceList.Items) == 0 {
+		return false, fmt.Sprintf("No ProtectedResource found defining type '%s/%s'.", apiGroup, kind), nil
 	}
 
-	return true, "Resource type is registered."
+	return true, "Resource type is registered.", nil
 }
 
 // validatePolicyBindingSubjects iterates through all subjects (users or groups) defined in a PolicyBinding's spec. For
@@ -603,7 +664,7 @@ func (r *PolicyBindingReconciler) validatePolicyBindingSubjects(ctx context.Cont
 			continue
 		}
 
-		fetchedSubject, err := r.getUnstructuredResourceAndMapping(ctx, iamdatumapiscomv1alpha1.SchemeGroupVersion.Group, subject.Kind, subject.Name, subject.Namespace)
+		fetchedSubject, err := r.getSubjectResource(ctx, iamdatumapiscomv1alpha1.SchemeGroupVersion.Group, subject.Kind, subject.Name, subject.Namespace)
 		if err != nil {
 			var subjectMsg string
 			var reason string
@@ -703,43 +764,24 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForProtectedResourceChang
 		"kindDefined", protectedResource.Spec.Kind)
 
 	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	errs := r.List(context.Background(), policyBindings) // List all policy bindings in the cluster.
-	if errs != nil {
-		log.Error(errs, "failed to list PolicyBindings for ProtectedResource change")
+	targetKindKey := fmt.Sprintf("%s/%s", protectedResource.Spec.ServiceRef.Name, protectedResource.Spec.Kind)
+	if err := r.List(ctx, policyBindings, client.MatchingFields{
+		openfga.TargetKindIndexField: targetKindKey,
+	}); err != nil {
+		log.Error(err, "failed to list PolicyBindings for ProtectedResource change")
 		return []reconcile.Request{}
 	}
 
-	requests := make([]reconcile.Request, 0)
+	requests := make([]reconcile.Request, 0, len(policyBindings.Items))
 	for _, pb := range policyBindings.Items {
-		var shouldEnqueue bool
-		var targetAPIGroup, targetKind string
-
-		// Extract APIGroup and Kind based on ResourceSelector type
-		if pb.Spec.ResourceSelector.ResourceRef != nil {
-			targetAPIGroup = pb.Spec.ResourceSelector.ResourceRef.APIGroup
-			targetKind = pb.Spec.ResourceSelector.ResourceRef.Kind
-		} else if pb.Spec.ResourceSelector.ResourceKind != nil {
-			targetAPIGroup = pb.Spec.ResourceSelector.ResourceKind.APIGroup
-			targetKind = pb.Spec.ResourceSelector.ResourceKind.Kind
-		}
-
-		// A PolicyBinding should be re-evaluated if its target APIGroup and Kind match the ServiceRef.Name and Kind of
-		// the changed ProtectedResource.
-		if targetAPIGroup == protectedResource.Spec.ServiceRef.Name &&
-			targetKind == protectedResource.Spec.Kind {
-			shouldEnqueue = true
-		}
-
-		if shouldEnqueue {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      pb.Name,
-					Namespace: pb.Namespace,
-				},
-			})
-			log.V(1).Info("Enqueuing PolicyBinding due to relevant ProtectedResource change",
-				"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace)
-		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      pb.Name,
+				Namespace: pb.Namespace,
+			},
+		})
+		log.V(1).Info("Enqueuing PolicyBinding due to relevant ProtectedResource change",
+			"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace)
 	}
 
 	return requests
@@ -773,12 +815,18 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 	}
 
 	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	if err := r.List(ctx, policyBindings); err != nil {
+	roleKey := openfga.RoleRefIndexKey(changedRole.Namespace, iamdatumapiscomv1alpha1.RoleReference{
+		Name:      changedRole.Name,
+		Namespace: changedRole.Namespace,
+	})
+	if err := r.List(ctx, policyBindings, client.MatchingFields{
+		openfga.RoleRefIndexField: roleKey,
+	}); err != nil {
 		log.Error(err, "failed to list PolicyBindings for Role change", "roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
 		return []reconcile.Request{}
 	}
 
-	requests := make([]reconcile.Request, 0)
+	requests := make([]reconcile.Request, 0, len(policyBindings.Items))
 	for _, pb := range policyBindings.Items {
 		// Resolve the bound Role. An empty RoleRef.Namespace defaults to the
 		// PolicyBinding's namespace.
@@ -813,6 +861,10 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.RESTMapper = mgr.GetRESTMapper()
 	}
 
+	if err := r.setupPolicyBindingIndexes(mgr); err != nil {
+		return err
+	}
+
 	// Initialize finalizers
 	r.Finalizers = finalizer.NewFinalizers()
 	if err := r.Finalizers.Register(policyBindingFinalizerKey, &openFGAFinalizer{
@@ -829,20 +881,86 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&iamdatumapiscomv1alpha1.PolicyBinding{}).
+		For(&iamdatumapiscomv1alpha1.PolicyBinding{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("policybinding")
 
 	// Watch for changes to ProtectedResource CRs and enqueue PolicyBindings that might be affected.
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.ProtectedResource{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueuePolicyBindingsForProtectedResourceChange),
+		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	// Watch for changes to Role CRs and enqueue PolicyBindings that might be affected.
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.Role{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueuePolicyBindingsForRoleChange),
+		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
-	return controllerBuilder.Complete(r)
+	return controllerBuilder.WithOptions(controller.Options{
+		MaxConcurrentReconciles: r.policyBindingMaxConcurrentReconciles(),
+	}).Complete(r)
+}
+
+func (r *PolicyBindingReconciler) policyBindingMaxConcurrentReconciles() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return defaultPolicyBindingMaxConcurrentReconciles
+}
+
+func (r *PolicyBindingReconciler) setupPolicyBindingIndexes(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iamdatumapiscomv1alpha1.PolicyBinding{}, openfga.TargetObjectIndexField, func(rawObj client.Object) []string {
+		policyBinding, ok := rawObj.(*iamdatumapiscomv1alpha1.PolicyBinding)
+		if !ok {
+			return nil
+		}
+		key, err := openfga.TargetObjectFromResourceSelector(policyBinding.Spec.ResourceSelector)
+		if err != nil {
+			return nil
+		}
+		return []string{key}
+	}); err != nil {
+		return fmt.Errorf("index PolicyBinding target object: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iamdatumapiscomv1alpha1.PolicyBinding{}, openfga.TargetKindIndexField, func(rawObj client.Object) []string {
+		policyBinding, ok := rawObj.(*iamdatumapiscomv1alpha1.PolicyBinding)
+		if !ok {
+			return nil
+		}
+		key, err := openfga.TargetKindFromResourceSelector(policyBinding.Spec.ResourceSelector)
+		if err != nil {
+			return nil
+		}
+		return []string{key}
+	}); err != nil {
+		return fmt.Errorf("index PolicyBinding target kind: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iamdatumapiscomv1alpha1.PolicyBinding{}, openfga.RoleRefIndexField, func(rawObj client.Object) []string {
+		policyBinding, ok := rawObj.(*iamdatumapiscomv1alpha1.PolicyBinding)
+		if !ok {
+			return nil
+		}
+		return []string{openfga.RoleRefIndexKey(policyBinding.Namespace, policyBinding.Spec.RoleRef)}
+	}); err != nil {
+		return fmt.Errorf("index PolicyBinding roleRef: %w", err)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &iamdatumapiscomv1alpha1.ProtectedResource{}, protectedResourceServiceKindIndexField, func(rawObj client.Object) []string {
+		protectedResource, ok := rawObj.(*iamdatumapiscomv1alpha1.ProtectedResource)
+		if !ok {
+			return nil
+		}
+		if protectedResource.Spec.ServiceRef.Name == "" || protectedResource.Spec.Kind == "" {
+			return nil
+		}
+		return []string{protectedResource.Spec.ServiceRef.Name + "/" + protectedResource.Spec.Kind}
+	}); err != nil {
+		return fmt.Errorf("index ProtectedResource service/kind: %w", err)
+	}
+
+	return nil
 }

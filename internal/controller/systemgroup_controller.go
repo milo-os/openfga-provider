@@ -3,17 +3,19 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+	"go.miloapis.com/auth-provider-openfga/internal/openfga"
 	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
-	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -28,6 +30,8 @@ const (
 	// authorization checks against InternalUserGroup:system_authenticated resolve
 	// correctly via OpenFGA's stored-tuple cache path.
 	systemAuthenticatedGroup = "system_authenticated"
+
+	defaultSystemGroupMaxConcurrentReconciles = 20
 )
 
 // SystemGroupReconciler watches User resources and ensures each user has the
@@ -36,10 +40,18 @@ const (
 // tuples are eligible for OpenFGA's check query cache.
 type SystemGroupReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	FGAClient  openfgav1.OpenFGAServiceClient
-	FGAStoreID string
-	mgr        mcmanager.Manager
+	Scheme                  *runtime.Scheme
+	FGAClient               openfgav1.OpenFGAServiceClient
+	FGAStoreID              string
+	mgr                     mcmanager.Manager
+	MaxConcurrentReconciles int
+}
+
+func (r *SystemGroupReconciler) maxConcurrentReconciles() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return defaultSystemGroupMaxConcurrentReconciles
 }
 
 // +kubebuilder:rbac:groups=iam.miloapis.com,resources=users;machineaccounts,verbs=get;list;watch;update;patch
@@ -54,8 +66,11 @@ func (r *SystemGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // For multicluster support (including MachineAccount controller), use SetupWithManagerMultiCluster.
 func (r *SystemGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := ctrl.NewControllerManagedBy(mgr).
-		For(&iamv1alpha1.User{}).
+		For(&iamv1alpha1.User{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("systemgroup_user").
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
 	}
@@ -70,16 +85,22 @@ func (r *SystemGroupReconciler) SetupWithManagerMultiCluster(mgr ctrl.Manager, m
 
 	// 1. Controller for human Users (cluster-scoped) - uses standard manager
 	if err := ctrl.NewControllerManagedBy(mgr).
-		For(&iamv1alpha1.User{}).
+		For(&iamv1alpha1.User{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("systemgroup_user").
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
 	}
 
 	// 2. Controller for service accounts (multi-cluster) - uses multicluster manager
 	if err := mcbuilder.ControllerManagedBy(r.mgr).
-		For(&iamv1alpha1.ServiceAccount{}).
+		For(&iamv1alpha1.ServiceAccount{}, mcbuilder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("systemgroup_serviceaccount").
+		WithOptions(controller.TypedOptions[mcreconcile.Request]{
+			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+		}).
 		Complete(mcreconcile.Func(r.reconcileServiceAccountMultiCluster)); err != nil {
 		return fmt.Errorf("failed to register serviceaccount systemgroup reconciler: %w", err)
 	}
@@ -178,7 +199,7 @@ func (r *SystemGroupReconciler) writeSystemGroupTuple(ctx context.Context, obj c
 		},
 	})
 	if err != nil {
-		if isAlreadyExistsErr(err) {
+		if openfga.IsAlreadyExistsErr(err) {
 			log.V(1).Info("system group membership tuple already exists in OpenFGA", "name", obj.GetName())
 			return nil
 		}
@@ -209,7 +230,7 @@ func (r *SystemGroupReconciler) deleteSystemGroupTuple(ctx context.Context, obj 
 		},
 	})
 	if err != nil {
-		if isTupleNotFoundErr(err) {
+		if openfga.IsTupleNotFoundErr(err) {
 			log.V(1).Info("system group membership tuple already absent from OpenFGA", "name", obj.GetName())
 			return nil
 		}
@@ -234,27 +255,4 @@ func (r *SystemGroupReconciler) systemGroupTupleKey(obj client.Object) *openfgav
 		Relation: "member",
 		Object:   fmt.Sprintf("iam.miloapis.com/InternalUserGroup:%s", systemAuthenticatedGroup),
 	}
-}
-
-// isAlreadyExistsErr reports whether the gRPC error indicates that the tuple
-// already exists in OpenFGA (code 2017).
-func isAlreadyExistsErr(err error) bool {
-	if st, ok := status.FromError(err); ok {
-		// OpenFGA uses gRPC application error code 2017 for "already exists".
-		return st.Code() == 2017
-	}
-	// Fallback: check the error message for robustness across SDK versions.
-	return strings.Contains(err.Error(), "already exists")
-}
-
-// isTupleNotFoundErr reports whether the gRPC error indicates that the tuple
-// does not exist in OpenFGA. OpenFGA has been observed returning code 2017
-// ("cannot delete a tuple which does not exist") and code 2018; both are
-// treated as "not found" so deletion is idempotent.
-func isTupleNotFoundErr(err error) bool {
-	if st, ok := status.FromError(err); ok {
-		return st.Code() == 2017 || st.Code() == 2018
-	}
-	return strings.Contains(err.Error(), "cannot delete a tuple which does not exist") ||
-		strings.Contains(err.Error(), "not found")
 }
