@@ -291,7 +291,14 @@ func (r *PolicyReconciler) buildPermissionTuples(
 	for _, subject := range binding.Spec.Subjects {
 		tupleUser, err := getTupleUser(subject)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get tuple user for subject %s: %w", subject.Name, err)
+			// A subject with an unresolvable identity (unsupported/unrecognized
+			// Kind, or missing UID) can't be translated into an OpenFGA user
+			// string, so no tuple can be built for it. Skip just this subject
+			// rather than failing the whole binding: other subjects on the same
+			// binding may still be perfectly valid and their tuples must not be
+			// dropped (this matters for sibling-binding tuple preservation during
+			// deletion, see siblingDesiredTuples).
+			continue
 		}
 
 		for _, permName := range effectivePerms {
@@ -371,17 +378,29 @@ func (r *PolicyReconciler) getHierarchicalPermissionsForSelector(ctx context.Con
 // getExistingTuples reads all tuples owned by this
 // PolicyBinding. Because tuples are indexed by subject user
 // and target object we query for each subject individually.
+//
+// If a subject's identity can't be resolved into an OpenFGA user string (for
+// example its Kind is unsupported/unrecognized, such as a stale
+// "MachineAccount" kind, or its UID is missing), there is no way to know which
+// tuple(s), if any, correspond to it. Rather than failing the whole lookup —
+// which would block PolicyBinding deletion forever via the finalizer path in
+// DeletePolicy — we log a warning and skip that subject: we simply can't
+// discover (or therefore need to retract) any tuples for it.
 func (r *PolicyReconciler) getExistingTuples(
 	ctx context.Context,
 	binding iamdatumapiscomv1alpha1.PolicyBinding,
 	targetObject string,
 ) ([]*openfgav1.TupleKey, error) {
+	log := logf.FromContext(ctx)
 	var all []*openfgav1.TupleKey
 
 	for _, subject := range binding.Spec.Subjects {
 		tupleUser, err := getTupleUser(subject)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get tuple user for subject %s: %w", subject.Name, err)
+			log.Info("Skipping subject with unresolvable identity when looking up existing tuples; nothing can be identified for it",
+				"binding", binding.Name, "namespace", binding.Namespace,
+				"subjectKind", subject.Kind, "subjectName", subject.Name, "reason", err.Error())
+			continue
 		}
 
 		// Read all tuples for (user, *, targetObject) — the relation wildcard
