@@ -93,6 +93,9 @@ type PolicyBindingReconciler struct {
 	StoreID       string
 	Finalizers    finalizer.Finalizers
 	EventRecorder record.EventRecorder
+	// ModelIDProvider pins writes to a known authorization model so OpenFGA
+	// does not resolve the store's latest model on every call. Optional.
+	ModelIDProvider openfga.ModelIDProvider
 	// MaxConcurrentReconciles controls PolicyBinding reconcile parallelism.
 	// When zero, defaultPolicyBindingMaxConcurrentReconciles is used.
 	MaxConcurrentReconciles int
@@ -444,9 +447,10 @@ func (r *PolicyBindingReconciler) reconcileSubjectValidation(ctx context.Context
 func (r *PolicyBindingReconciler) reconcileOpenFGAPolicy(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	policyReconciler := openfga.PolicyReconciler{
-		StoreID:   r.StoreID,
-		Client:    r.FgaClient,
-		K8sClient: r.Client,
+		StoreID:         r.StoreID,
+		Client:          r.FgaClient,
+		K8sClient:       r.Client,
+		ModelIDProvider: r.ModelIDProvider,
 	}
 
 	if err := policyReconciler.ReconcilePolicy(ctx, *policyBinding); err != nil {
@@ -866,9 +870,10 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		fgaClient: r.FgaClient,
 		storeID:   r.StoreID,
 		policyReconciler: &openfga.PolicyReconciler{
-			StoreID:   r.StoreID,
-			Client:    r.FgaClient,
-			K8sClient: r.Client,
+			StoreID:         r.StoreID,
+			Client:          r.FgaClient,
+			K8sClient:       r.Client,
+			ModelIDProvider: r.ModelIDProvider,
 		},
 	}); err != nil {
 		return fmt.Errorf("failed to register policy binding finalizer: %w", err)

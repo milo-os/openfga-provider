@@ -23,6 +23,9 @@ type PolicyReconciler struct {
 	StoreID   string
 	Client    openfgav1.OpenFGAServiceClient
 	K8sClient client.Client
+	// ModelIDProvider pins writes to a known authorization model so OpenFGA
+	// does not resolve the store's latest model on every call. Optional.
+	ModelIDProvider ModelIDProvider
 }
 
 // ReconcilePolicy ensures the correct tuples for a
@@ -79,7 +82,8 @@ func (r *PolicyReconciler) DeletePolicy(ctx context.Context, binding iamdatumapi
 	}
 
 	_, err = r.Client.Write(ctx, &openfgav1.WriteRequest{
-		StoreId: r.StoreID,
+		StoreId:              r.StoreID,
+		AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
 		Deletes: &openfgav1.WriteRequestDeletes{
 			TupleKeys: convertTuplesForDelete(toDelete),
 		},
@@ -153,7 +157,8 @@ func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatum
 	}
 
 	writeReq := &openfgav1.WriteRequest{
-		StoreId: r.StoreID,
+		StoreId:              r.StoreID,
+		AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
 	}
 
 	if len(added) > 0 {

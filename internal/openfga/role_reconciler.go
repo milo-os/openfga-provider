@@ -18,6 +18,9 @@ type RoleReconciler struct {
 	StoreID      string
 	OpenFGA      openfgav1.OpenFGAServiceClient
 	ControlPlane client.Client
+	// ModelIDProvider pins writes to a known authorization model so OpenFGA
+	// does not resolve the store's latest model on every call. Optional.
+	ModelIDProvider ModelIDProvider
 }
 
 // ReconcileRole is a no-op. Permissions are inlined into PolicyBinding tuples
@@ -43,7 +46,8 @@ func (r *RoleReconciler) DeleteRole(ctx context.Context, role iamdatumapiscomv1a
 	}
 
 	_, err = r.OpenFGA.Write(ctx, &openfgav1.WriteRequest{
-		StoreId: r.StoreID,
+		StoreId:              r.StoreID,
+		AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
 		Deletes: &openfgav1.WriteRequestDeletes{
 			TupleKeys: convertTuplesForDelete(existingTupleKeys),
 		},

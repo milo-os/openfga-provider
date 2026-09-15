@@ -52,7 +52,10 @@ type SystemGroupReconciler struct {
 	Scheme     *runtime.Scheme
 	FGAClient  openfgav1.OpenFGAServiceClient
 	FGAStoreID string
-	mgr        mcmanager.Manager
+	// ModelIDProvider pins writes to a known authorization model so OpenFGA
+	// does not resolve the store's latest model on every call. Optional.
+	ModelIDProvider openfga.ModelIDProvider
+	mgr             mcmanager.Manager
 }
 
 // +kubebuilder:rbac:groups=iam.miloapis.com,resources=users;machineaccounts,verbs=get;list;watch;update;patch
@@ -197,7 +200,8 @@ func (r *SystemGroupReconciler) writeSystemGroupTuple(ctx context.Context, obj c
 	tupleKey := r.systemGroupTupleKey(obj)
 
 	_, err := r.FGAClient.Write(ctx, &openfgav1.WriteRequest{
-		StoreId: r.FGAStoreID,
+		StoreId:              r.FGAStoreID,
+		AuthorizationModelId: openfga.ModelIDFrom(r.ModelIDProvider),
 		Writes: &openfgav1.WriteRequestWrites{
 			TupleKeys: []*openfgav1.TupleKey{tupleKey},
 		},
@@ -222,7 +226,8 @@ func (r *SystemGroupReconciler) deleteSystemGroupTuple(ctx context.Context, obj 
 	tupleKey := r.systemGroupTupleKey(obj)
 
 	_, err := r.FGAClient.Write(ctx, &openfgav1.WriteRequest{
-		StoreId: r.FGAStoreID,
+		StoreId:              r.FGAStoreID,
+		AuthorizationModelId: openfga.ModelIDFrom(r.ModelIDProvider),
 		Deletes: &openfgav1.WriteRequestDeletes{
 			TupleKeys: []*openfgav1.TupleKeyWithoutCondition{
 				{

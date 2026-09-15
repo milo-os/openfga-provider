@@ -14,6 +14,9 @@ type UserGroupReconciler struct {
 	StoreID   string
 	Client    openfgav1.OpenFGAServiceClient
 	K8sClient client.Client
+	// ModelIDProvider pins writes to a known authorization model so OpenFGA
+	// does not resolve the store's latest model on every call. Optional.
+	ModelIDProvider ModelIDProvider
 }
 
 type GroupMembershipRequest struct {
@@ -40,7 +43,8 @@ func (r *UserGroupReconciler) AddMemberToGroup(ctx context.Context, joinToGroupR
 	// If the tuple key does not exist, write it to the OpenFGA store
 	if !checkResp.Allowed {
 		writeRequest := &openfgav1.WriteRequest{
-			StoreId: r.StoreID,
+			StoreId:              r.StoreID,
+			AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
 			Writes: &openfgav1.WriteRequestWrites{
 				TupleKeys: tupleKeys,
 			},
@@ -81,8 +85,9 @@ func (r *UserGroupReconciler) RemoveMemberFromGroup(ctx context.Context, groupMe
 		}
 
 		_, err = r.Client.Write(ctx, &openfgav1.WriteRequest{
-			StoreId: r.StoreID,
-			Deletes: deleteRequest,
+			StoreId:              r.StoreID,
+			AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
+			Deletes:              deleteRequest,
 		})
 		if err != nil {
 			// Check above can be racy; not-found means the tuple is gone, so treat as success.
