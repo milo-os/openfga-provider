@@ -1,0 +1,330 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: role-inheritance-propagation
+# Regression test for inherited-role permission propagation.
+#
+# Scenario (mirrors datum-cloud-viewer -> networking-viewer -> gateway-viewer):
+# a subject is bound to the leaf role of a 3-level inheritance chain. After the
+# top role of the chain gains a new permission, that permission must propagate
+#   1. to the leaf Role's status.effectivePermissions (role controller re-reconciles
+#      descendants when an inherited role changes), and
+#   2. to the live authorization decision for the bound subject (the PolicyBinding
+#      tuples are re-baked).
+#
+# Before the fix, the leaf role's effective permissions went stale and the subject
+# kept getting denied on the newly added permission, so steps (1) and (2) below
+# would time out.
+spec:
+  steps:
+    # --- Build the inheritance chain: gateway-viewer <- networking-viewer <- org-viewer ---
+    - try:
+        - apply:
+            file: roles/gateway-viewer.yaml
+        - wait:
+            apiVersion: iam.miloapis.com/v1alpha1
+            kind: Role
+            name: inheritance-gateway-viewer
+            timeout: 5m
+            for:
+              condition:
+                name: Ready
+                value: "true"
+        - apply:
+            file: roles/networking-viewer.yaml
+        - wait:
+            apiVersion: iam.miloapis.com/v1alpha1
+            kind: Role
+            name: inheritance-networking-viewer
+            timeout: 5m
+            for:
+              condition:
+                name: Ready
+                value: "true"
+        - apply:
+            file: roles/org-viewer.yaml
+        - wait:
+            apiVersion: iam.miloapis.com/v1alpha1
+            kind: Role
+            name: inheritance-org-viewer
+            timeout: 5m
+            for:
+              condition:
+                name: Ready
+                value: "true"
+
+    # --- Baseline: the leaf role inherits exactly the top role's two permissions ---
+    - try:
+        - assert:
+            timeout: 2m
+            resource:
+              apiVersion: iam.miloapis.com/v1alpha1
+              kind: Role
+              metadata:
+                name: inheritance-org-viewer
+              status:
+                (length(effectivePermissions)): 2
+                effectivePermissions:
+                  - resourcemanager.miloapis.com/organizations.get
+                  - resourcemanager.miloapis.com/organizations.list
+
+    # --- Bind a user to the leaf role on Organization "role-inheritance-test-org" ---
+    - try:
+        - create:
+            file: user.yaml
+            outputs:
+              - name: user
+                value: (@)
+        - create:
+            file: organization.yaml
+            outputs:
+              - name: org
+                value: (@)
+        - apply:
+            resource:
+              apiVersion: iam.miloapis.com/v1alpha1
+              kind: PolicyBinding
+              metadata:
+                name: inheritance-org-viewer-binding
+              spec:
+                roleRef:
+                  name: inheritance-org-viewer
+                  namespace: ($namespace)
+                subjects:
+                  - kind: User
+                    name: "inheritance-viewer-user"
+                    uid: ($user.metadata.uid)
+                resourceSelector:
+                  resourceRef:
+                    apiGroup: "resourcemanager.miloapis.com"
+                    kind: Organization
+                    name: "role-inheritance-test-org"
+                    uid: ($org.metadata.uid)
+        - wait:
+            apiVersion: iam.miloapis.com/v1alpha1
+            kind: PolicyBinding
+            name: inheritance-org-viewer-binding
+            timeout: 5m
+            for:
+              condition:
+                name: Ready
+                value: "true"
+
+    # --- Baseline authorization: inherited "get" is allowed ---
+    - try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: sar-get-allowed
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: curl
+                  image: curlimages/curl:latest
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      response=$(curl -ksS https://auth-provider-openfga-authz-webhook.auth-provider-openfga-system.svc.cluster.local:8090/apis/authorization.k8s.io/v1/subjectaccessreviews \
+                        -H "Content-Type: application/json" \
+                        -d @- << EOF
+                      {
+                        "apiVersion": "authorization.k8s.io/v1",
+                        "kind": "SubjectAccessReview",
+                        "spec": {
+                          "user": "inheritance-viewer-user",
+                          "uid": "inheritance-viewer-user",
+                          "extra": {
+                            "resourcemanager.miloapis.com/organization-id": ["role-inheritance-test-org"]
+                          },
+                          "groups": ["system:authenticated"],
+                          "resourceAttributes": {
+                            "group": "resourcemanager.miloapis.com",
+                            "resource": "organizations",
+                            "version": "v1alpha1",
+                            "verb": "get",
+                            "name": "role-inheritance-test-org"
+                          }
+                        }
+                      }
+                      EOF
+                      )
+                      echo "Webhook response: $response"
+                      if ! echo "$response" | grep -q '"kind":"SubjectAccessReview"'; then
+                        echo "Webhook test failed - invalid response format"
+                        exit 1
+                      fi
+                      if echo "$response" | grep -q '"allowed"[[:space:]]*:[[:space:]]*true'; then
+                        echo "Baseline get allowed - OK"
+                        exit 0
+                      else
+                        echo "Baseline get should have been allowed"
+                        exit 1
+                      fi
+        - wait:
+            apiVersion: v1
+            kind: Pod
+            name: sar-get-allowed
+            timeout: 30s
+            for:
+              jsonPath:
+                path: "status.phase"
+                value: "Succeeded"
+
+    # --- Before the change: "update" (not yet in the chain) is denied ---
+    - try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: sar-update-denied
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: curl
+                  image: curlimages/curl:latest
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      response=$(curl -ksS https://auth-provider-openfga-authz-webhook.auth-provider-openfga-system.svc.cluster.local:8090/apis/authorization.k8s.io/v1/subjectaccessreviews \
+                        -H "Content-Type: application/json" \
+                        -d @- << EOF
+                      {
+                        "apiVersion": "authorization.k8s.io/v1",
+                        "kind": "SubjectAccessReview",
+                        "spec": {
+                          "user": "inheritance-viewer-user",
+                          "uid": "inheritance-viewer-user",
+                          "extra": {
+                            "resourcemanager.miloapis.com/organization-id": ["role-inheritance-test-org"]
+                          },
+                          "groups": ["system:authenticated"],
+                          "resourceAttributes": {
+                            "group": "resourcemanager.miloapis.com",
+                            "resource": "organizations",
+                            "version": "v1alpha1",
+                            "verb": "update",
+                            "name": "role-inheritance-test-org"
+                          }
+                        }
+                      }
+                      EOF
+                      )
+                      echo "Webhook response: $response"
+                      if ! echo "$response" | grep -q '"kind":"SubjectAccessReview"'; then
+                        echo "Webhook test failed - invalid response format"
+                        exit 1
+                      fi
+                      if echo "$response" | grep -q '"allowed"[[:space:]]*:[[:space:]]*false'; then
+                        echo "Update correctly denied before the permission was added - OK"
+                        exit 0
+                      else
+                        echo "Update should have been denied before the permission was added"
+                        exit 1
+                      fi
+        - wait:
+            apiVersion: v1
+            kind: Pod
+            name: sar-update-denied
+            timeout: 30s
+            for:
+              jsonPath:
+                path: "status.phase"
+                value: "Succeeded"
+
+    # --- Mutate the TOP of the chain: add organizations.update to gateway-viewer ---
+    - try:
+        - apply:
+            file: roles/gateway-viewer-updated.yaml
+        - assert:
+            timeout: 2m
+            resource:
+              apiVersion: iam.miloapis.com/v1alpha1
+              kind: Role
+              metadata:
+                name: inheritance-gateway-viewer
+              status:
+                (length(effectivePermissions)): 3
+                effectivePermissions:
+                  - resourcemanager.miloapis.com/organizations.get
+                  - resourcemanager.miloapis.com/organizations.list
+                  - resourcemanager.miloapis.com/organizations.update
+
+    # --- Gap A: the new permission propagates to the LEAF role's effective permissions ---
+    - try:
+        - assert:
+            timeout: 2m
+            resource:
+              apiVersion: iam.miloapis.com/v1alpha1
+              kind: Role
+              metadata:
+                name: inheritance-org-viewer
+              status:
+                (length(effectivePermissions)): 3
+                effectivePermissions:
+                  - resourcemanager.miloapis.com/organizations.get
+                  - resourcemanager.miloapis.com/organizations.list
+                  - resourcemanager.miloapis.com/organizations.update
+
+    # --- Gap B: the bound subject is now allowed to "update" (tuples were re-baked) ---
+    - try:
+        - apply:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: sar-update-allowed
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: curl
+                  image: curlimages/curl:latest
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      # The tuple re-bake is asynchronous; retry until OpenFGA reflects it.
+                      for i in $(seq 1 30); do
+                        response=$(curl -ksS https://auth-provider-openfga-authz-webhook.auth-provider-openfga-system.svc.cluster.local:8090/apis/authorization.k8s.io/v1/subjectaccessreviews \
+                          -H "Content-Type: application/json" \
+                          -d @- << EOF
+                      {
+                        "apiVersion": "authorization.k8s.io/v1",
+                        "kind": "SubjectAccessReview",
+                        "spec": {
+                          "user": "inheritance-viewer-user",
+                          "uid": "inheritance-viewer-user",
+                          "extra": {
+                            "resourcemanager.miloapis.com/organization-id": ["role-inheritance-test-org"]
+                          },
+                          "groups": ["system:authenticated"],
+                          "resourceAttributes": {
+                            "group": "resourcemanager.miloapis.com",
+                            "resource": "organizations",
+                            "version": "v1alpha1",
+                            "verb": "update",
+                            "name": "role-inheritance-test-org"
+                          }
+                        }
+                      }
+                      EOF
+                        )
+                        echo "Attempt $i webhook response: $response"
+                        if echo "$response" | grep -q '"allowed"[[:space:]]*:[[:space:]]*true'; then
+                          echo "Update allowed after permission propagated - OK"
+                          exit 0
+                        fi
+                        sleep 5
+                      done
+                      echo "Update was never allowed after the permission was added to the inherited role"
+                      exit 1
+        - wait:
+            apiVersion: v1
+            kind: Pod
+            name: sar-update-allowed
+            timeout: 3m
+            for:
+              jsonPath:
+                path: "status.phase"
+                value: "Succeeded"

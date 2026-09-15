@@ -802,29 +802,48 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 		"roleName", changedRole.Name,
 		"roleNamespace", changedRole.Namespace)
 
-	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	roleKey := openfga.RoleRefIndexKey(changedRole.Namespace, iamdatumapiscomv1alpha1.RoleReference{
-		Name:      changedRole.Name,
-		Namespace: changedRole.Namespace,
-	})
-	if err := r.List(ctx, policyBindings, client.MatchingFields{
-		openfga.RoleRefIndexField: roleKey,
-	}); err != nil {
-		log.Error(err, "failed to list PolicyBindings for Role change", "roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
+	// A PolicyBinding's baked permission tuples derive from the effective
+	// permissions of its bound Role, which include permissions inherited
+	// transitively. So a binding must be re-evaluated not only when its bound
+	// Role changes directly, but also when any Role it transitively inherits
+	// changes. Compute the set of bound Roles affected by this change (the
+	// changed Role plus every Role that inherits it).
+	affectedRoles, err := rolesDependentOnRole(ctx, r.Client, client.ObjectKey{Namespace: changedRole.Namespace, Name: changedRole.Name})
+	if err != nil {
+		log.Error(err, "failed to compute Roles dependent on changed Role", "roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
 		return []reconcile.Request{}
 	}
 
-	requests := make([]reconcile.Request, 0, len(policyBindings.Items))
-	for _, pb := range policyBindings.Items {
-		requests = append(requests, reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      pb.Name,
-				Namespace: pb.Namespace,
-			},
+	// Look up PolicyBindings bound to any of the affected Roles (the changed
+	// Role plus every Role that transitively inherits it) via the roleRef
+	// index, one query per affected Role. A binding can only match one
+	// affected Role's key, so no de-duplication is needed across queries.
+	requests := make([]reconcile.Request, 0)
+	for boundRole := range affectedRoles {
+		roleKey := openfga.RoleRefIndexKey(boundRole.Namespace, iamdatumapiscomv1alpha1.RoleReference{
+			Name:      boundRole.Name,
+			Namespace: boundRole.Namespace,
 		})
-		log.V(1).Info("Enqueuing PolicyBinding due to relevant Role change",
-			"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace,
-			"changedRoleName", changedRole.Name, "changedRoleNamespace", changedRole.Namespace)
+		policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
+		if err := r.List(ctx, policyBindings, client.MatchingFields{
+			openfga.RoleRefIndexField: roleKey,
+		}); err != nil {
+			log.Error(err, "failed to list PolicyBindings for Role change", "roleName", boundRole.Name, "roleNamespace", boundRole.Namespace)
+			continue
+		}
+
+		for _, pb := range policyBindings.Items {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      pb.Name,
+					Namespace: pb.Namespace, // This is the PolicyBinding's namespace
+				},
+			})
+			log.V(1).Info("Enqueuing PolicyBinding due to relevant Role change",
+				"policyBindingName", pb.Name, "policyBindingNamespace", pb.Namespace,
+				"boundRoleName", boundRole.Name, "boundRoleNamespace", boundRole.Namespace,
+				"changedRoleName", changedRole.Name, "changedRoleNamespace", changedRole.Namespace)
+		}
 	}
 	return requests
 }
@@ -866,11 +885,13 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
-	// Watch for changes to Role CRs and enqueue PolicyBindings that might be affected.
+	// Watch Role changes, unfiltered: a status-only update (e.g. effective
+	// permissions recomputed after an ancestor Role change) doesn't bump
+	// generation, but still needs to re-trigger a bound PolicyBinding's
+	// tuple re-bake.
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.Role{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueuePolicyBindingsForRoleChange),
-		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
 	return controllerBuilder.WithOptions(controller.Options{

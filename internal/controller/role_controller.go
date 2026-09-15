@@ -252,51 +252,6 @@ func (r *RoleReconciler) setDegradedCondition(ctx context.Context, role *iamdatu
 	}
 }
 
-// enqueueRequestsForInheritedRoleChange enqueues every Role that inherits the
-// changed Role. When a previously-missing inherited role is created, its
-// dependents reconcile promptly and converge to fully-Ready instead of waiting
-// out an exponential backoff.
-func (r *RoleReconciler) enqueueRequestsForInheritedRoleChange(ctx context.Context, obj client.Object) []reconcile.Request {
-	log := logf.FromContext(ctx)
-	changedRole, ok := obj.(*iamdatumapiscomv1alpha1.Role)
-	if !ok {
-		log.Error(fmt.Errorf("unexpected object type in Role inheritance handler: %T", obj), "cannot enqueue Roles")
-		return []reconcile.Request{}
-	}
-
-	roleList := &iamdatumapiscomv1alpha1.RoleList{}
-	if err := r.List(ctx, roleList); err != nil {
-		log.Error(err, "failed to list Roles for inherited-role change handler")
-		return []reconcile.Request{}
-	}
-
-	requests := make([]reconcile.Request, 0)
-	for i := range roleList.Items {
-		dependent := &roleList.Items[i]
-		// The role's own changes are already handled by the primary For()
-		// watch; only enqueue other roles that inherit it.
-		if dependent.Namespace == changedRole.Namespace && dependent.Name == changedRole.Name {
-			continue
-		}
-		for _, ref := range dependent.Spec.InheritedRoles {
-			refNamespace := dependent.Namespace
-			if ref.Namespace != "" {
-				refNamespace = ref.Namespace
-			}
-			if refNamespace == changedRole.Namespace && ref.Name == changedRole.Name {
-				requests = append(requests, reconcile.Request{
-					NamespacedName: client.ObjectKey{Name: dependent.Name, Namespace: dependent.Namespace},
-				})
-				log.V(1).Info("Enqueuing Role due to inherited Role change",
-					"roleName", dependent.Name, "roleNamespace", dependent.Namespace,
-					"changedRole", changedRole.Namespace+"/"+changedRole.Name)
-				break
-			}
-		}
-	}
-	return requests
-}
-
 // validateRolePermissions checks if all effective permissions in a role are validly defined by known ProtectedResources.
 func (r *RoleReconciler) validateRolePermissions(ctx context.Context, role *iamdatumapiscomv1alpha1.Role, protectedResources []iamdatumapiscomv1alpha1.ProtectedResource, effectivePermissions []string) ([]string, error) {
 	log := logf.FromContext(ctx).WithValues("roleName", role.Name)
@@ -542,6 +497,41 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	return ctrl.Result{}, nil
 }
 
+// enqueueRequestsForInheritedRoleChange is a handler that enqueues reconcile
+// requests for every Role that transitively inherits the changed Role. A Role's
+// effective permissions are computed from its inherited Roles, so when an
+// inherited (ancestor) Role's permissions change, the descendant Roles must be
+// re-reconciled to refresh their Status.EffectivePermissions. The changed Role
+// itself is reconciled via the primary For() watch and is skipped here.
+func (r *RoleReconciler) enqueueRequestsForInheritedRoleChange(ctx context.Context, obj client.Object) []reconcile.Request {
+	log := logf.FromContext(ctx)
+	changedRole, ok := obj.(*iamdatumapiscomv1alpha1.Role)
+	if !ok {
+		log.Error(fmt.Errorf("unexpected object type in Role handler for Roles: %T", obj), "cannot enqueue Roles")
+		return []reconcile.Request{}
+	}
+
+	changedKey := client.ObjectKey{Namespace: changedRole.Namespace, Name: changedRole.Name}
+	dependents, err := rolesDependentOnRole(ctx, r.Client, changedKey)
+	if err != nil {
+		log.Error(err, "failed to compute Roles dependent on changed Role",
+			"roleName", changedRole.Name, "roleNamespace", changedRole.Namespace)
+		return []reconcile.Request{}
+	}
+
+	requests := make([]reconcile.Request, 0, len(dependents))
+	for key := range dependents {
+		if key == changedKey {
+			continue // reconciled via the primary For() watch
+		}
+		requests = append(requests, reconcile.Request{NamespacedName: key})
+		log.V(1).Info("Enqueuing Role due to inherited Role change",
+			"roleName", key.Name, "roleNamespace", key.Namespace,
+			"changedRoleName", changedRole.Name, "changedRoleNamespace", changedRole.Namespace)
+	}
+	return requests
+}
+
 // enqueueRequestsForProtectedResourceChange is a handler that enqueues Role reconcile requests
 // when a ProtectedResource changes.
 func (r *RoleReconciler) enqueueRequestsForProtectedResourceChange(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -620,9 +610,13 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 	)
 
-	// Watch Roles so that when a previously-missing inherited Role appears, the
-	// Roles that inherit it reconcile promptly and converge without waiting out
-	// the controller's exponential backoff.
+	// Watch for changes to other Roles and enqueue the Roles that transitively
+	// inherit them, so descendant Roles refresh their effective permissions
+	// when an inherited (ancestor) Role's permissions change, and so a
+	// previously-missing inherited Role reconciles its dependents promptly
+	// once it appears instead of waiting out the controller's exponential
+	// backoff. Filtered to spec changes (generation bumps) to avoid reacting
+	// to our own status updates.
 	controllerBuilder.Watches(
 		&iamdatumapiscomv1alpha1.Role{},
 		handler.EnqueueRequestsFromMapFunc(r.enqueueRequestsForInheritedRoleChange),
