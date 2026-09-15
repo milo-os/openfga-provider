@@ -421,6 +421,7 @@ func (r *GroupMembershipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return controllerBuilder.
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
 		}).
 		Complete(r)
 }

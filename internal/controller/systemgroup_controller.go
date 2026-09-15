@@ -70,6 +70,7 @@ func (r *SystemGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("systemgroup_user").
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
 		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
@@ -89,6 +90,7 @@ func (r *SystemGroupReconciler) SetupWithManagerMultiCluster(mgr ctrl.Manager, m
 		Named("systemgroup_user").
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
 		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
@@ -100,6 +102,7 @@ func (r *SystemGroupReconciler) SetupWithManagerMultiCluster(mgr ctrl.Manager, m
 		Named("systemgroup_serviceaccount").
 		WithOptions(controller.TypedOptions[mcreconcile.Request]{
 			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+			RateLimiter:             newJitteredRateLimiter[mcreconcile.Request](),
 		}).
 		Complete(mcreconcile.Func(r.reconcileServiceAccountMultiCluster)); err != nil {
 		return fmt.Errorf("failed to register serviceaccount systemgroup reconciler: %w", err)
