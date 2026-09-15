@@ -31,7 +31,16 @@ const (
 	// correctly via OpenFGA's stored-tuple cache path.
 	systemAuthenticatedGroup = "system_authenticated"
 
-	defaultSystemGroupMaxConcurrentReconciles = 20
+	// systemGroupMaxConcurrentReconciles must stay 1, and is intentionally not
+	// configurable. Every principal's membership tuple targets the same OpenFGA
+	// object (InternalUserGroup:system_authenticated), and each reconcile writes
+	// its tuple in a separate transaction. Concurrent reconciles therefore all
+	// contend for that one row and serialise into a lock convoy in OpenFGA's
+	// datastore, until requests exceed its internal deadline and fail. Raising
+	// this reintroduces that failure mode, so there is deliberately no override
+	// to raise it by accident. Reconciling one at a time costs little: an
+	// uncontended write is a few milliseconds.
+	systemGroupMaxConcurrentReconciles = 1
 )
 
 // SystemGroupReconciler watches User resources and ensures each user has the
@@ -40,18 +49,10 @@ const (
 // tuples are eligible for OpenFGA's check query cache.
 type SystemGroupReconciler struct {
 	client.Client
-	Scheme                  *runtime.Scheme
-	FGAClient               openfgav1.OpenFGAServiceClient
-	FGAStoreID              string
-	mgr                     mcmanager.Manager
-	MaxConcurrentReconciles int
-}
-
-func (r *SystemGroupReconciler) maxConcurrentReconciles() int {
-	if r.MaxConcurrentReconciles > 0 {
-		return r.MaxConcurrentReconciles
-	}
-	return defaultSystemGroupMaxConcurrentReconciles
+	Scheme     *runtime.Scheme
+	FGAClient  openfgav1.OpenFGAServiceClient
+	FGAStoreID string
+	mgr        mcmanager.Manager
 }
 
 // +kubebuilder:rbac:groups=iam.miloapis.com,resources=users;machineaccounts,verbs=get;list;watch;update;patch
@@ -69,7 +70,8 @@ func (r *SystemGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&iamv1alpha1.User{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("systemgroup_user").
 		WithOptions(controller.Options{
-			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+			MaxConcurrentReconciles: systemGroupMaxConcurrentReconciles,
+			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
 		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
@@ -88,7 +90,8 @@ func (r *SystemGroupReconciler) SetupWithManagerMultiCluster(mgr ctrl.Manager, m
 		For(&iamv1alpha1.User{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("systemgroup_user").
 		WithOptions(controller.Options{
-			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+			MaxConcurrentReconciles: systemGroupMaxConcurrentReconciles,
+			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
 		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
@@ -99,7 +102,8 @@ func (r *SystemGroupReconciler) SetupWithManagerMultiCluster(mgr ctrl.Manager, m
 		For(&iamv1alpha1.ServiceAccount{}, mcbuilder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("systemgroup_serviceaccount").
 		WithOptions(controller.TypedOptions[mcreconcile.Request]{
-			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
+			MaxConcurrentReconciles: systemGroupMaxConcurrentReconciles,
+			RateLimiter:             newJitteredRateLimiter[mcreconcile.Request](),
 		}).
 		Complete(mcreconcile.Func(r.reconcileServiceAccountMultiCluster)); err != nil {
 		return fmt.Errorf("failed to register serviceaccount systemgroup reconciler: %w", err)
