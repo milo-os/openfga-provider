@@ -31,7 +31,15 @@ const (
 	// correctly via OpenFGA's stored-tuple cache path.
 	systemAuthenticatedGroup = "system_authenticated"
 
-	defaultSystemGroupMaxConcurrentReconciles = 20
+	// defaultSystemGroupMaxConcurrentReconciles is deliberately 1. Every
+	// principal's membership tuple targets the same OpenFGA object
+	// (InternalUserGroup:system_authenticated), and each reconcile writes its
+	// tuple in a separate transaction. Concurrent reconciles therefore all
+	// contend for the same row, which serialises them into a lock convoy in
+	// OpenFGA's datastore until requests exceed its internal deadline.
+	// Reconciling one at a time costs little (an uncontended write is a few
+	// milliseconds) and removes the contention entirely.
+	defaultSystemGroupMaxConcurrentReconciles = 1
 )
 
 // SystemGroupReconciler watches User resources and ensures each user has the
