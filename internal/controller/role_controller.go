@@ -90,6 +90,9 @@ type RoleReconciler struct {
 	StoreID       string
 	Finalizers    finalizer.Finalizers
 	EventRecorder record.EventRecorder
+	// ModelIDProvider pins writes to a known authorization model so OpenFGA
+	// does not resolve the store's latest model on every call. Optional.
+	ModelIDProvider openfga.ModelIDProvider
 	// MaxConcurrentReconciles controls Role reconcile parallelism. When zero,
 	// defaultRoleMaxConcurrentReconciles is used.
 	MaxConcurrentReconciles int
@@ -437,9 +440,10 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	if permValidationCondition.Status == metav1.ConditionTrue {
 		openFgaReconciler := openfga.RoleReconciler{
-			StoreID:      r.StoreID,
-			OpenFGA:      r.FgaClient,
-			ControlPlane: r.Client,
+			StoreID:         r.StoreID,
+			OpenFGA:         r.FgaClient,
+			ControlPlane:    r.Client,
+			ModelIDProvider: r.ModelIDProvider,
 		}
 		if err := openFgaReconciler.ReconcileRole(ctx, role); err != nil {
 			log.Error(err, "Failed to reconcile Role with OpenFGA")
@@ -592,9 +596,10 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := r.Finalizers.Register(roleFinalizerKey, &OpenFGARoleFinalizer{
 		Client: r.Client,
 		roleReconciler: &openfga.RoleReconciler{
-			StoreID:      r.StoreID,
-			OpenFGA:      r.FgaClient,
-			ControlPlane: r.Client,
+			StoreID:         r.StoreID,
+			OpenFGA:         r.FgaClient,
+			ControlPlane:    r.Client,
+			ModelIDProvider: r.ModelIDProvider,
 		},
 	}); err != nil {
 		return fmt.Errorf("failed to register role finalizer: %w", err)

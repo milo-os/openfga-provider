@@ -60,6 +60,9 @@ type GroupMembershipReconciler struct {
 	Finalizers          finalizer.Finalizers
 	EventRecorder       record.EventRecorder
 	UserGroupReconciler *openfga.UserGroupReconciler
+	// ModelIDProvider pins writes to a known authorization model so OpenFGA
+	// does not resolve the store's latest model on every call. Optional.
+	ModelIDProvider openfga.ModelIDProvider
 	// MaxConcurrentReconciles controls GroupMembership reconcile parallelism.
 	// When zero, defaultGroupMembershipMaxConcurrentReconciles is used.
 	MaxConcurrentReconciles int
@@ -366,9 +369,10 @@ func (r *GroupMembershipReconciler) enqueueGroupMembershipsForGroupChange(ctx co
 // SetupWithManager sets up the controller with the Manager.
 func (r *GroupMembershipReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.UserGroupReconciler = &openfga.UserGroupReconciler{
-		StoreID:   r.StoreID,
-		Client:    r.FgaClient,
-		K8sClient: r.Client,
+		StoreID:         r.StoreID,
+		Client:          r.FgaClient,
+		K8sClient:       r.Client,
+		ModelIDProvider: r.ModelIDProvider,
 	}
 
 	r.Finalizers = finalizer.NewFinalizers()

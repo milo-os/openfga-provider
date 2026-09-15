@@ -12,6 +12,7 @@ import (
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"github.com/spf13/cobra"
 	"go.miloapis.com/auth-provider-openfga/internal/controller"
+	"go.miloapis.com/auth-provider-openfga/internal/webhook"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -298,12 +299,35 @@ func runManager(
 		return fmt.Errorf("unable to create local manager: %w", err)
 	}
 
+	// Pin tuple writes to a known authorization model. Without an explicit ID,
+	// OpenFGA resolves the store's latest model on every write, which reads the
+	// whole authorization_model table and costs seconds per call for a large
+	// model. The authorization webhook already pins the ID on Check for the same
+	// reason; this gives the write path the same treatment.
+	//
+	// The ConfigMap lives on the local workload cluster rather than the remote
+	// control plane KUBECONFIG points at, so prefer an in-cluster informer.
+	// The signal-handler context is not set up until later in startup, and the
+	// watcher's informer should live as long as the process does, so it gets a
+	// background context.
+	watcherCtx := context.Background()
+	var modelIDWatcher *webhook.AuthorizationModelIDWatcher
+	if inClusterCfg, inClusterErr := rest.InClusterConfig(); inClusterErr == nil {
+		modelIDWatcher, err = webhook.NewAuthorizationModelIDWatcherWithConfig(watcherCtx, inClusterCfg, configmapNamespace, configmapName, "")
+	} else {
+		modelIDWatcher, err = webhook.NewAuthorizationModelIDWatcher(watcherCtx, localMgr, configmapNamespace, configmapName, "")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create authorization model ID watcher: %w", err)
+	}
+
 	if err = (&controller.RoleReconciler{
-		Client:        localMgr.GetClient(),
-		Scheme:        localMgr.GetScheme(),
-		FgaClient:     fgaClient,
-		StoreID:       openfgaStoreID,
-		EventRecorder: localMgr.GetEventRecorderFor("role-controller"),
+		Client:          localMgr.GetClient(),
+		Scheme:          localMgr.GetScheme(),
+		FgaClient:       fgaClient,
+		StoreID:         openfgaStoreID,
+		EventRecorder:   localMgr.GetEventRecorderFor("role-controller"),
+		ModelIDProvider: modelIDWatcher,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller Role: %w", err)
 	}
@@ -314,6 +338,7 @@ func runManager(
 		FgaClient:               fgaClient,
 		StoreID:                 openfgaStoreID,
 		EventRecorder:           localMgr.GetEventRecorderFor("policybinding-controller"),
+		ModelIDProvider:         modelIDWatcher,
 		MaxConcurrentReconciles: policyBindingMaxConcurrentReconciles,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller PolicyBinding: %w", err)
@@ -356,11 +381,12 @@ func runManager(
 	}
 
 	if err = (&controller.GroupMembershipReconciler{
-		Client:        localMgr.GetClient(),
-		Scheme:        localMgr.GetScheme(),
-		FgaClient:     fgaClient,
-		StoreID:       openfgaStoreID,
-		EventRecorder: localMgr.GetEventRecorderFor("groupmembership-controller"),
+		Client:          localMgr.GetClient(),
+		Scheme:          localMgr.GetScheme(),
+		FgaClient:       fgaClient,
+		StoreID:         openfgaStoreID,
+		EventRecorder:   localMgr.GetEventRecorderFor("groupmembership-controller"),
+		ModelIDProvider: modelIDWatcher,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller GroupMembership: %w", err)
 	}
@@ -368,10 +394,11 @@ func runManager(
 	// SystemGroupReconciler registers the User controller on localMgr and the
 	// ServiceAccount controller on mcMgr.
 	if err = (&controller.SystemGroupReconciler{
-		Client:     localMgr.GetClient(),
-		Scheme:     localMgr.GetScheme(),
-		FGAClient:  fgaClient,
-		FGAStoreID: openfgaStoreID,
+		Client:          localMgr.GetClient(),
+		Scheme:          localMgr.GetScheme(),
+		FGAClient:       fgaClient,
+		FGAStoreID:      openfgaStoreID,
+		ModelIDProvider: modelIDWatcher,
 	}).SetupWithManagerMultiCluster(localMgr, mcMgr); err != nil {
 		return fmt.Errorf("unable to create controller SystemGroup: %w", err)
 	}
