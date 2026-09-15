@@ -29,3 +29,15 @@ func (r *jitteredRateLimiter[T]) When(item T) time.Duration {
 func newJitteredRateLimiter[T comparable]() workqueue.TypedRateLimiter[T] {
 	return &jitteredRateLimiter[T]{TypedRateLimiter: workqueue.DefaultTypedControllerRateLimiter[T]()}
 }
+
+// enablePriorityQueue turns on controller-runtime's priority queue, which gives
+// events from the initial list-watch and from resyncs a lower priority than
+// genuine changes. Without it an object created while a controller is still
+// draining its startup backlog waits behind every synced item; with it, real
+// changes are reconciled first regardless of how long the backlog takes.
+//
+// The priority queue is still beta in controller-runtime.
+func enablePriorityQueue() *bool {
+	enabled := true
+	return &enabled
+}

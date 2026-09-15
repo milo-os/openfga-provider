@@ -902,6 +902,7 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return controllerBuilder.WithOptions(controller.Options{
 		MaxConcurrentReconciles: r.policyBindingMaxConcurrentReconciles(),
 		RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
+		UsePriorityQueue:        enablePriorityQueue(),
 	}).Complete(r)
 }
 
