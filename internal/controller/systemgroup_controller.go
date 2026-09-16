@@ -7,6 +7,7 @@ import (
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"go.miloapis.com/auth-provider-openfga/internal/openfga"
 	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -75,6 +76,7 @@ func (r *SystemGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: systemGroupMaxConcurrentReconciles,
 			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
+			UsePriorityQueue:        enablePriorityQueue(),
 		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
@@ -95,6 +97,7 @@ func (r *SystemGroupReconciler) SetupWithManagerMultiCluster(mgr ctrl.Manager, m
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: systemGroupMaxConcurrentReconciles,
 			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
+			UsePriorityQueue:        enablePriorityQueue(),
 		}).
 		Complete(reconcile.Func(r.reconcileUser)); err != nil {
 		return fmt.Errorf("failed to register user systemgroup reconciler: %w", err)
@@ -107,6 +110,7 @@ func (r *SystemGroupReconciler) SetupWithManagerMultiCluster(mgr ctrl.Manager, m
 		WithOptions(controller.TypedOptions[mcreconcile.Request]{
 			MaxConcurrentReconciles: systemGroupMaxConcurrentReconciles,
 			RateLimiter:             newJitteredRateLimiter[mcreconcile.Request](),
+			UsePriorityQueue:        enablePriorityQueue(),
 		}).
 		Complete(mcreconcile.Func(r.reconcileServiceAccountMultiCluster)); err != nil {
 		return fmt.Errorf("failed to register serviceaccount systemgroup reconciler: %w", err)
@@ -199,6 +203,15 @@ func (r *SystemGroupReconciler) writeSystemGroupTuple(ctx context.Context, obj c
 
 	tupleKey := r.systemGroupTupleKey(obj)
 
+	// Skip the write when the tuple is already stored.
+	if exists, readErr := r.systemGroupTupleExists(ctx, tupleKey); readErr != nil {
+		log.V(1).Info("could not read system group membership tuple, writing anyway",
+			"name", obj.GetName(), "error", readErr.Error())
+	} else if exists {
+		log.V(1).Info("system group membership tuple already present, skipping write", "name", obj.GetName())
+		return nil
+	}
+
 	_, err := r.FGAClient.Write(ctx, &openfgav1.WriteRequest{
 		StoreId:              r.FGAStoreID,
 		AuthorizationModelId: openfga.ModelIDFrom(r.ModelIDProvider),
@@ -216,6 +229,25 @@ func (r *SystemGroupReconciler) writeSystemGroupTuple(ctx context.Context, obj c
 
 	log.V(1).Info("wrote system group membership tuple", "name", obj.GetName())
 	return nil
+}
+
+// systemGroupTupleExists reports whether the exact membership tuple is already
+// stored. It reads the specific tuple rather than issuing a Check so an
+// indirectly-derived membership cannot mask a missing stored tuple.
+func (r *SystemGroupReconciler) systemGroupTupleExists(ctx context.Context, tupleKey *openfgav1.TupleKey) (bool, error) {
+	resp, err := r.FGAClient.Read(ctx, &openfgav1.ReadRequest{
+		StoreId:  r.FGAStoreID,
+		PageSize: wrapperspb.Int32(1),
+		TupleKey: &openfgav1.ReadRequestTupleKey{
+			User:     tupleKey.User,
+			Relation: tupleKey.Relation,
+			Object:   tupleKey.Object,
+		},
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(resp.GetTuples()) > 0, nil
 }
 
 // deleteSystemGroupTuple deletes the system:authenticated membership tuple for

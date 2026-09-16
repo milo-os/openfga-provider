@@ -632,6 +632,7 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.maxConcurrentReconciles(),
 			RateLimiter:             newJitteredRateLimiter[ctrl.Request](),
+			UsePriorityQueue:        enablePriorityQueue(),
 		}).
 		Complete(r)
 }
