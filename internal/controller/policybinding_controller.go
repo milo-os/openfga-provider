@@ -146,7 +146,7 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Validate the resource selector in the policy binding is valid
-	isValid, err := r.reconcileResourceSelectorValidation(ctx, policyBinding, oldStatus, currentGeneration)
+	isValid, targetMissing, err := r.reconcileResourceSelectorValidation(ctx, policyBinding, oldStatus, currentGeneration)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to validate resource selector: %w", err)
 	}
@@ -165,13 +165,15 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after ResourceSelector validation failure: %w", err)
 		}
-		// Resource selector validation failed. Stop reconciliation. Rely on the policy binding being re-reconciled when the target
-		// resource is created.
-		return ctrl.Result{}, nil
+		// Nothing watches target resources, so a target that does not exist yet would never trigger another reconcile.
+		// This happens routinely: Milo creates a User's self-manage PolicyBinding in the User admission webhook, before
+		// the User is persisted. Requeue with the rate limiter's exponential backoff so the binding converges once the
+		// target appears. Other validation failures need a spec change, which re-triggers reconciliation on its own.
+		return ctrl.Result{Requeue: targetMissing}, nil
 	}
 
 	// Validate the subjects in the policy binding are valid and exist in the cluster.
-	isValid, err = r.reconcileSubjectValidation(ctx, policyBinding, oldStatus, currentGeneration)
+	isValid, subjectMissing, err := r.reconcileSubjectValidation(ctx, policyBinding, oldStatus, currentGeneration)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to validate subjects: %w", err)
 	}
@@ -189,9 +191,9 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after subject validation failure: %w", err)
 		}
-		// Subject validation failed. Stop reconciliation. Rely on the policy binding being re-reconciled when the subjects
-		// are created.
-		return ctrl.Result{}, nil
+		// Subjects are not watched either, so a subject that does not exist yet is retried with backoff for the same
+		// reason as a missing target.
+		return ctrl.Result{Requeue: subjectMissing}, nil
 	}
 
 	// At this juncture, both ResourceSelector and all Subjects have been successfully validated. Their respective conditions
@@ -229,18 +231,20 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // reconcileResourceSelectorValidation performs validation based on whether ResourceRef or ResourceKind is specified.
 // For ResourceRef, it validates the specific resource instance exists and matches the UID.
 // For ResourceKind, it validates that the resource type is registered in ProtectedResources.
-func (r *PolicyBindingReconciler) reconcileResourceSelectorValidation(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
+// targetMissing reports that validation failed only because the target instance does not exist yet.
+func (r *PolicyBindingReconciler) reconcileResourceSelectorValidation(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, targetMissing bool, err error) {
 	if policyBinding.Spec.ResourceSelector.ResourceRef != nil {
 		return r.validateResourceRef(ctx, policyBinding, oldStatus, currentGeneration)
 	} else if policyBinding.Spec.ResourceSelector.ResourceKind != nil {
-		return r.validateResourceKind(ctx, policyBinding, oldStatus, currentGeneration)
+		isValid, err := r.validateResourceKind(ctx, policyBinding, oldStatus, currentGeneration)
+		return isValid, false, err
 	} else {
-		return false, fmt.Errorf("ResourceSelector is empty")
+		return false, false, fmt.Errorf("ResourceSelector is empty")
 	}
 }
 
 // validateResourceRef validates a specific resource instance referenced by ResourceRef
-func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
+func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, targetMissing bool, err error) {
 	log := logf.FromContext(ctx)
 
 	resourceRef := policyBinding.Spec.ResourceSelector.ResourceRef
@@ -248,7 +252,7 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 	// Validate if the target type specified in the PolicyBinding is registered by any ProtectedResource.
 	isKnownType, typeValidationReason, err := r.validateResourceType(ctx, resourceRef.APIGroup, resourceRef.Kind)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if !isKnownType {
 		meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
@@ -262,7 +266,7 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 			ObservedGeneration: currentGeneration,
 		})
 
-		return false, nil // No requeue, type definition needs to be fixed.
+		return false, false, nil // No requeue, type definition needs to be fixed.
 	}
 
 	// Get the actual target resource instance.
@@ -271,7 +275,6 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 	if err != nil {
 		var errMsg string
 		var reason string
-		stopReconciliation := true
 
 		if meta.IsNoMatchError(err) {
 			errMsg = fmt.Sprintf("Target Kind '%s' in group '%s' not recognized by the API server.", resourceRef.Kind, resourceRef.APIGroup)
@@ -283,7 +286,7 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 			errMsg = missingNsErr.Error()
 			reason = "TargetNamespaceMissing"
 		} else {
-			return false, fmt.Errorf("failed to validate target %s/%s: %w", resourceRef.Kind, resourceRef.Name, err)
+			return false, false, fmt.Errorf("failed to validate target %s/%s: %w", resourceRef.Kind, resourceRef.Name, err)
 		}
 
 		log.Info(errMsg, "policyBindingName", policyBinding.Name)
@@ -295,12 +298,9 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 			ObservedGeneration: currentGeneration,
 		})
 
-		if !stopReconciliation {
-			// Requeue if the error was deemed transient or requires a retry.
-			return false, fmt.Errorf("failed to validate target %s/%s: %w", resourceRef.Kind, resourceRef.Name, err)
-		}
-		// For non-requeueable validation errors (e.g., NotFound, KindNotRecognized), stop reconciliation.
-		return false, nil
+		// A missing target may still be on its way, so the caller retries it with backoff. The other failures here need a
+		// spec or registration change and are not retried.
+		return false, apierrors.IsNotFound(err), nil
 	}
 
 	// Compare the UID of the fetched target resource with the UID specified in the PolicyBinding.
@@ -324,7 +324,7 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 		})
 
 		// UID mismatch is a definitive validation failure. Stop reconciliation.
-		return false, nil
+		return false, false, nil
 	}
 
 	// All ResourceRef validations (type registration, instance existence, UID match) passed.
@@ -336,7 +336,7 @@ func (r *PolicyBindingReconciler) validateResourceRef(ctx context.Context, polic
 		ObservedGeneration: currentGeneration,
 	})
 
-	return true, nil
+	return true, false, nil
 }
 
 // validateResourceKind validates a resource kind for system-wide access
@@ -394,12 +394,12 @@ func (r *PolicyBindingReconciler) validateResourceKind(ctx context.Context, poli
 //
 // The function returns `isValid=true` if all subjects are valid, and `isValid=false` otherwise. It also returns a
 // `ctrl.Result` and `error` to guide the main Reconcile loop (e.g., to requeue or stop).
-func (r *PolicyBindingReconciler) reconcileSubjectValidation(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, err error) {
+func (r *PolicyBindingReconciler) reconcileSubjectValidation(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (isValid bool, subjectMissing bool, err error) {
 	log := logf.FromContext(ctx)
 
-	subjectsAreValid, subjectValidationMessages, err := r.validatePolicyBindingSubjects(ctx, policyBinding, oldStatus, currentGeneration)
+	subjectsAreValid, subjectMissing, subjectValidationMessages, err := r.validatePolicyBindingSubjects(ctx, policyBinding, oldStatus, currentGeneration)
 	if err != nil {
-		return false, fmt.Errorf("failed to validate PolicyBinding subjects: %w", err)
+		return false, false, fmt.Errorf("failed to validate PolicyBinding subjects: %w", err)
 	}
 
 	if !subjectsAreValid {
@@ -415,7 +415,7 @@ func (r *PolicyBindingReconciler) reconcileSubjectValidation(ctx context.Context
 			LastTransitionTime: metav1.Now(),
 		})
 		// Validation failed cleanly; stop reconciliation. Status will be persisted by the caller.
-		return false, nil
+		return false, subjectMissing, nil
 	}
 
 	// All subjects were found, their kinds recognized, and UIDs were provided as required.
@@ -426,7 +426,7 @@ func (r *PolicyBindingReconciler) reconcileSubjectValidation(ctx context.Context
 		Message:            "All subjects validated successfully.",
 		LastTransitionTime: metav1.Now(),
 	})
-	return true, nil
+	return true, false, nil
 }
 
 // reconcileOpenFGAPolicy is responsible for synchronizing the state defined in the PolicyBinding custom resource with
@@ -645,7 +645,7 @@ func (r *PolicyBindingReconciler) validateResourceType(
 // actual resource's UID. It accumulates validation messages for
 // any invalid subjects. If a subject lookup results in an API error that suggests a transient issue (not a simple "not
 // found" or "kind not recognized"), it returns an error to trigger a requeue of the PolicyBinding.
-func (r *PolicyBindingReconciler) validatePolicyBindingSubjects(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (subjectsValid bool, validationMessages []string, requeueErr error) {
+func (r *PolicyBindingReconciler) validatePolicyBindingSubjects(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (subjectsValid bool, subjectMissing bool, validationMessages []string, requeueErr error) {
 	log := logf.FromContext(ctx)
 	subjectsValid = true // Assume valid until proven otherwise.
 
@@ -687,11 +687,12 @@ func (r *PolicyBindingReconciler) validatePolicyBindingSubjects(ctx context.Cont
 
 				subjectMsg = fmt.Sprintf("Subject %s/%s (namespace: '%s') not found.", subject.Kind, subject.Name, subject.Namespace)
 				reason = "NotFound"
+				subjectMissing = true
 			} else if missingNsErr, ok := err.(*MissingNamespaceError); ok {
 				subjectMsg = missingNsErr.Error()
 				reason = "NamespaceMissing"
 			} else {
-				return false, validationMessages, fmt.Errorf("failed to validate subject %s/%s: %w", subject.Kind, subject.Name, err)
+				return false, false, validationMessages, fmt.Errorf("failed to validate subject %s/%s: %w", subject.Kind, subject.Name, err)
 			}
 
 			log.Info(subjectMsg, "policyBindingName", policyBinding.Name, "subjectName", subject.Name)
@@ -720,7 +721,7 @@ func (r *PolicyBindingReconciler) validatePolicyBindingSubjects(ctx context.Cont
 		}
 	}
 
-	return subjectsValid, validationMessages, nil
+	return subjectsValid, subjectMissing, validationMessages, nil
 }
 
 // PolicyBindingFinalizer implements the finalizer.Finalizer interface. It is responsible for cleaning up authorization
