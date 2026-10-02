@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+	"go.miloapis.com/auth-provider-openfga/internal/permissions"
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -20,9 +21,11 @@ import (
 // Tuples are written as one tuple per (subject × permission) pair directly
 // on the target resource object.
 type PolicyReconciler struct {
-	StoreID   string
-	Client    openfgav1.OpenFGAServiceClient
-	K8sClient client.Client
+	// EnableSubresourceAuthorization enables explicit, independently registered subresource permissions.
+	EnableSubresourceAuthorization bool
+	StoreID                        string
+	Client                         openfgav1.OpenFGAServiceClient
+	K8sClient                      client.Client
 	// ModelIDProvider pins writes to a known authorization model so OpenFGA
 	// does not resolve the store's latest model on every call. Optional.
 	ModelIDProvider ModelIDProvider
@@ -118,6 +121,11 @@ func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatum
 
 	role, err := r.fetchRole(ctx, binding)
 	if err != nil {
+		if r.EnableSubresourceAuthorization && apierrors.IsNotFound(err) {
+			if deleteErr := r.DeletePolicy(ctx, binding); deleteErr != nil {
+				return fmt.Errorf("failed to revoke missing role permissions: %w", deleteErr)
+			}
+		}
 		return fmt.Errorf("failed to fetch role: %w", err)
 	}
 
@@ -210,6 +218,9 @@ func (r *PolicyReconciler) siblingDesiredTuples(
 	var desired []*openfgav1.TupleKey
 	for i := range siblingBindings.Items {
 		other := siblingBindings.Items[i]
+		if other.DeletionTimestamp != nil {
+			continue
+		}
 
 		// Skip the binding itself.
 		if other.Namespace == binding.Namespace && other.Name == binding.Name {
@@ -263,6 +274,9 @@ func (r *PolicyReconciler) fetchRole(ctx context.Context, binding iamdatumapisco
 		return nil, fmt.Errorf("failed to get role '%s': %w", binding.Spec.RoleRef.Name, err)
 	}
 
+	if r.EnableSubresourceAuthorization && role.DeletionTimestamp != nil {
+		return nil, apierrors.NewNotFound(iamdatumapiscomv1alpha1.SchemeGroupVersion.WithResource("roles").GroupResource(), role.Name)
+	}
 	return role, nil
 }
 
@@ -300,11 +314,14 @@ func (r *PolicyReconciler) buildPermissionTuples(
 		}
 
 		for _, permName := range effectivePerms {
+			if p, ok := permissions.Parse(permName); ok && p.Subresource != "" && !r.EnableSubresourceAuthorization {
+				continue
+			}
 			// Skip permissions not valid for the target resource type.
 			// validPerms contains the hierarchical permission set: the
 			// target resource's own permissions plus all descendant
 			// resource permissions.
-			if len(validPerms) > 0 {
+			if r.EnableSubresourceAuthorization || len(validPerms) > 0 {
 				if _, ok := validPerms[permName]; !ok {
 					continue
 				}
@@ -345,7 +362,7 @@ func (r *PolicyReconciler) getHierarchicalPermissionsForSelector(ctx context.Con
 
 	// Build the resource graph and compute hierarchical permissions, reusing
 	// the same logic as the authorization model builder.
-	resourceGraph, err := getResourceGraph(prList.Items)
+	resourceGraph, err := getResourceGraph(prList.Items, r.EnableSubresourceAuthorization)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build resource graph: %w", err)
 	}

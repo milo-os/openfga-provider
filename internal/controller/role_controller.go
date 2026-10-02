@@ -8,6 +8,7 @@ import (
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"go.miloapis.com/auth-provider-openfga/internal/openfga"
+	"go.miloapis.com/auth-provider-openfga/internal/permissions"
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -39,25 +40,6 @@ const (
 	defaultRoleMaxConcurrentReconciles = 20
 )
 
-// parsePermissionString splits a permission string into its components.
-// Expected format: <apiGroup>/<resourcePlural>.<permissionName>
-// Returns apiGroup, resourcePlural, permName, and a boolean indicating if the format is valid.
-func parsePermissionString(permStr string) (string, string, string, bool) {
-	parts := strings.SplitN(permStr, "/", 2)
-	if len(parts) != 2 {
-		return "", "", "", false
-	}
-	apiGroup := parts[0]
-
-	resourceAndPerm := strings.SplitN(parts[1], ".", 2)
-	if len(resourceAndPerm) != 2 {
-		return apiGroup, "", "", false
-	}
-	resourcePlural := resourceAndPerm[0]
-	permName := resourceAndPerm[1]
-	return apiGroup, resourcePlural, permName, true
-}
-
 // OpenFGARoleFinalizer handles deletion of OpenFGA tuples for a Role.
 type OpenFGARoleFinalizer struct {
 	client.Client
@@ -84,6 +66,8 @@ func (f *OpenFGARoleFinalizer) Finalize(ctx context.Context, obj client.Object) 
 
 // RoleReconciler reconciles a Role object
 type RoleReconciler struct {
+	// EnableSubresourceAuthorization enables explicit, independently registered subresource permissions.
+	EnableSubresourceAuthorization bool
 	client.Client
 	Scheme        *runtime.Scheme
 	FgaClient     openfgav1.OpenFGAServiceClient
@@ -261,7 +245,7 @@ func (r *RoleReconciler) validateRolePermissions(ctx context.Context, role *iamd
 	var invalidPermissions []string
 
 	for _, permStr := range effectivePermissions {
-		permAPIGroup, permResourcePlural, permName, isValidFormat := parsePermissionString(permStr)
+		permission, isValidFormat := permissions.Parse(permStr)
 		if !isValidFormat {
 			log.Info("Invalid permission format encountered during validation", "permission", permStr, "role", role.Name)
 			invalidPermissions = append(invalidPermissions, permStr+" (invalid format)")
@@ -269,15 +253,10 @@ func (r *RoleReconciler) validateRolePermissions(ctx context.Context, role *iamd
 		}
 
 		isPermissionDefined := false
-	validationLoop:
 		for _, pr := range protectedResources {
-			if pr.Spec.ServiceRef.Name == permAPIGroup && pr.Spec.Plural == permResourcePlural {
-				for _, definedPerm := range pr.Spec.Permissions {
-					if definedPerm == permName {
-						isPermissionDefined = true
-						break validationLoop
-					}
-				}
+			if pr.DeletionTimestamp == nil && permissions.Defined(pr.Spec, permission, r.EnableSubresourceAuthorization) {
+				isPermissionDefined = true
+				break
 			}
 		}
 		if !isPermissionDefined {
@@ -318,18 +297,15 @@ func (r *RoleReconciler) isRoleAffectedByProtectedResource(ctx context.Context, 
 	}
 
 	for _, permStr := range effectivePermissions {
-		permAPIGroup, permResourcePlural, permName, isValidFormat := parsePermissionString(permStr)
+		permission, isValidFormat := permissions.Parse(permStr)
 		if !isValidFormat {
 			continue
 		}
 
-		if permAPIGroup == changedPrAPIGroup && permResourcePlural == changedPrPlural {
-			for _, definedPerm := range pr.Spec.Permissions {
-				if definedPerm == permName {
-					roleLog.V(1).Info("Role is affected by ProtectedResource change due to matching permission", "permission", permStr)
-					return true, nil
-				}
-			}
+		// Match the resource identity, including removed permissions. Comparing
+		// only currently declared verbs would miss revocation and deletion.
+		if permission.APIGroup == changedPrAPIGroup && permission.Resource == changedPrPlural {
+			return true, nil
 		}
 	}
 

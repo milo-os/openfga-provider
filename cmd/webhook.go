@@ -37,6 +37,7 @@ import (
 func createWebhookCommand() *cobra.Command {
 	var certDir, certFile, keyFile string
 	var openfgaAPIURL string
+	var enableSubresourceAuthorization bool
 	var openfgaStoreID string
 	var openfgaScheme string
 	var webhookPort int
@@ -53,7 +54,7 @@ func createWebhookCommand() *cobra.Command {
 		Long:  "Start the authorization webhook server that validates SubjectAccessReview requests using OpenFGA.",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return runWebhookServer(
-				certDir,
+				enableSubresourceAuthorization, certDir,
 				certFile,
 				keyFile,
 				openfgaAPIURL,
@@ -90,6 +91,8 @@ func createWebhookCommand() *cobra.Command {
 	cmd.Flags().StringVar(&configmapName, "configmap-name", "openfga-authorization-model",
 		"Name of the ConfigMap that stores the current authorization model ID.")
 
+	cmd.Flags().BoolVar(&enableSubresourceAuthorization, "enable-subresource-authorization", false, "Authorize and program explicit subresource permissions (must match manager and webhook).")
+
 	// Mark required flags
 	if err := cmd.MarkFlagRequired("openfga-api-url"); err != nil {
 		panic(fmt.Sprintf("failed to mark openfga-api-url as required: %v", err))
@@ -102,7 +105,7 @@ func createWebhookCommand() *cobra.Command {
 }
 
 func runWebhookServer(
-	certDir string,
+	enableSubresourceAuthorization bool, certDir string,
 	certFile string,
 	keyFile string,
 	openfgaAPIURL string,
@@ -243,11 +246,12 @@ func runWebhookServer(
 	// from the in-memory informer cache instead of making a network round-trip on
 	// every SubjectAccessReview.
 	webhook.RegisterSubjectAccessReviewWebhook(hookServer, webhook.Config{
-		FGAClient:              fgaClient,
-		FGAStoreID:             openfgaStoreID,
-		ModelIDWatcher:         modelIDWatcher,
-		ProtectedResourceCache: prCache,
-		DiscoveryClient:        discoveryClient,
+		EnableSubresourceAuthorization: enableSubresourceAuthorization,
+		FGAClient:                      fgaClient,
+		FGAStoreID:                     openfgaStoreID,
+		ModelIDWatcher:                 modelIDWatcher,
+		ProtectedResourceCache:         prCache,
+		DiscoveryClient:                discoveryClient,
 	})
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

@@ -79,6 +79,8 @@ func (f *ProtectedResourceFinalizer) Finalize(ctx context.Context, obj client.Ob
 // triggers updates to the OpenFGA store to ensure the authorization model
 // reflects the state defined by these resources.
 type AuthorizationModelReconciler struct {
+	// EnableSubresourceAuthorization enables explicit, independently registered subresource permissions.
+	EnableSubresourceAuthorization bool
 	client.Client
 	Scheme     *runtime.Scheme
 	FGAClient  openfgav1.OpenFGAServiceClient
@@ -93,9 +95,10 @@ type AuthorizationModelReconciler struct {
 	// controller uses a remote KUBECONFIG (e.g. for a Milo control plane) but
 	// ConfigMap operations need to target the local workload cluster. When nil,
 	// the primary Client is used as a fallback.
-	ConfigMapClient client.Client
-	modelBuilder    *openfga.AuthorizationModelReconciler
-	Finalizers      finalizer.Finalizers
+	ConfigMapClient  client.Client
+	modelBuilder     *openfga.AuthorizationModelReconciler
+	modelInitialized bool
+	Finalizers       finalizer.Finalizers
 }
 
 //+kubebuilder:rbac:groups=iam.miloapis.com,resources=protectedresources,verbs=get;list;watch;update;patch
@@ -152,7 +155,7 @@ func (r *AuthorizationModelReconciler) reconcileProtectedResource(ctx context.Co
 	log := logf.FromContext(ctx).WithValues("protectedResourceName", triggeringPR.Name, "operation", "reconcileProtectedResource")
 
 	// Already reconciled at this generation
-	if triggeringPR.Status.ObservedGeneration == triggeringPR.Generation {
+	if r.modelInitialized && triggeringPR.Status.ObservedGeneration == triggeringPR.Generation {
 		log.V(1).Info("ProtectedResource already observed at current generation, skipping authorization model reconciliation")
 		return ctrl.Result{}, nil
 	}
@@ -171,6 +174,7 @@ func (r *AuthorizationModelReconciler) reconcileProtectedResource(ctx context.Co
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile IAM authorization model: %w", err)
 	}
 
+	r.modelInitialized = true
 	log.Info("Successfully reconciled IAM authorization model.")
 	if err := r.updateTriggeringPRStatus(ctx, triggeringPR, oldStatus, true, "IAMSystemConfigured", "Resource is configured to be protected by the IAM system."); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update ProtectedResource status: %w", err)
@@ -222,28 +226,15 @@ func (r *AuthorizationModelReconciler) updateTriggeringPRStatus(
 	return nil
 }
 
-// protectedResourceEventPredicate skips reconciling ProtectedResource events
-// that don't need it: replayed Create events (e.g. on restart) are filtered
-// unless the model is stale, deletion is in progress, or the finalizer is
-// missing; Update events use the same check, since deletion starting or a
-// finalizer being stripped never bumps generation.
+// protectedResourceEventPredicate reconciles startup replays to account for
+// process configuration changes, and spec/deletion updates thereafter.
 func protectedResourceEventPredicate() predicate.Predicate {
 	return predicate.Funcs{
+		// Replay on startup: feature settings can change without any resource
+		// generation changing. The first reconcile rebuilds the complete model.
 		CreateFunc: func(e event.CreateEvent) bool {
-			pr, ok := e.Object.(*iamdatumapiscomv1alpha1.ProtectedResource)
-			if !ok {
-				return false
-			}
-
-			// Real creates must always be reconciled. Filter only objects
-			// replayed from the informer's initial list.
-			if !e.IsInInitialList {
-				return true
-			}
-
-			return pr.Status.ObservedGeneration != pr.Generation ||
-				pr.GetDeletionTimestamp() != nil ||
-				!controllerutil.ContainsFinalizer(pr, protectedResourceFinalizerKey)
+			_, ok := e.Object.(*iamdatumapiscomv1alpha1.ProtectedResource)
+			return ok
 		},
 
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -285,11 +276,12 @@ func (r *AuthorizationModelReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		cmClient = r.Client
 	}
 	r.modelBuilder = &openfga.AuthorizationModelReconciler{
-		StoreID:       r.FGAStoreID,
-		OpenFGA:       r.FGAClient,
-		K8sClient:     cmClient,
-		Namespace:     r.ConfigMapNamespace,
-		ConfigMapName: r.ConfigMapName,
+		EnableSubresourceAuthorization: r.EnableSubresourceAuthorization,
+		StoreID:                        r.FGAStoreID,
+		OpenFGA:                        r.FGAClient,
+		K8sClient:                      cmClient,
+		Namespace:                      r.ConfigMapNamespace,
+		ConfigMapName:                  r.ConfigMapName,
 	}
 
 	// Initialize the finalizer manager and register our custom

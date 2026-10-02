@@ -221,3 +221,41 @@ task validate  # or appropriate validation task
 ```
 
 This ensures all layers and environments build correctly without deployment.
+
+### Subresource authorization (opt in)
+
+Subresource authorization is **off by default**. Enable it on both the controller
+manager and authorization webhook by setting their deployment environment variable
+`ENABLE_SUBRESOURCE_AUTHORIZATION` to `"true"`. The base manifests pass this value
+to `--enable-subresource-authorization`; when running binaries directly, pass that
+flag to both `manager` and `authz-webhook`.
+
+When enabled, declare subresource verbs separately in a `ProtectedResource`:
+
+```yaml
+spec:
+  permissions: [get, patch, update]
+  subresources:
+    - name: status
+      permissions: [get, patch, update]
+```
+
+A role grants `example.com/widgets/status.patch` independently of
+`example.com/widgets.patch` and `example.com/widgets/status.update`. Unknown
+subresources and undeclared verbs deny access. Permissions bind to the owning
+resource and inherit through the existing parent and Root hierarchy. Both model
+creation and binding reconciliation use these same registered permissions.
+
+Deploy the additive Milo API schema first. Prepare subresource registrations and
+role grants before opting in; existing base grants will no longer authorize
+subresource requests once the webhook flag is enabled. Enable the manager first,
+wait for model and binding reconciliation, then enable the webhook. Keep the
+settings aligned after rollout. Controllers rebuild the model on restart even
+when registration generations have not changed. With the flag disabled, the
+webhook retains legacy behavior and ignores the SAR subresource; the control
+plane excludes subresource permissions from its generated model and tuples.
+
+For rollback, disable the webhook first, then the manager, and wait for both
+rollouts and authorization caches to converge. This restores the original
+base-permission behavior. This capability does not automatically change service
+registrations or service roles.

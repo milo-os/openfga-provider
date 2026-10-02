@@ -44,6 +44,7 @@ func createManagerCommand() *cobra.Command {
 	var enableLeaderElection bool
 	var probeAddr string
 	var openfgaAPIURL string
+	var enableSubresourceAuthorization bool
 	var openfgaStoreID string
 	var openfgaScheme string
 
@@ -72,7 +73,7 @@ func createManagerCommand() *cobra.Command {
 		Long:  "Start the Kubernetes controller manager that reconciles IAM resources with OpenFGA.",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return runManager(
-				metricsAddr,
+				enableSubresourceAuthorization, metricsAddr,
 				enableLeaderElection,
 				probeAddr,
 				openfgaAPIURL,
@@ -131,6 +132,8 @@ func createManagerCommand() *cobra.Command {
 	cmd.Flags().DurationVar(&openfgaKeepaliveTimeout, "openfga-keepalive-timeout", 10*time.Second,
 		"The timeout duration to wait for a keepalive ping response from the OpenFGA server.")
 
+	cmd.Flags().BoolVar(&enableSubresourceAuthorization, "enable-subresource-authorization", false, "Authorize and program explicit subresource permissions (must match manager and webhook).")
+
 	// Mark required flags
 	if err := cmd.MarkFlagRequired("openfga-api-url"); err != nil {
 		panic(fmt.Sprintf("failed to mark openfga-api-url as required: %v", err))
@@ -144,7 +147,7 @@ func createManagerCommand() *cobra.Command {
 
 //nolint:gocyclo
 func runManager(
-	metricsAddr string,
+	enableSubresourceAuthorization bool, metricsAddr string,
 	enableLeaderElection bool,
 	probeAddr string,
 	openfgaAPIURL string,
@@ -322,24 +325,26 @@ func runManager(
 	}
 
 	if err = (&controller.RoleReconciler{
-		Client:          localMgr.GetClient(),
-		Scheme:          localMgr.GetScheme(),
-		FgaClient:       fgaClient,
-		StoreID:         openfgaStoreID,
-		EventRecorder:   localMgr.GetEventRecorderFor("role-controller"),
-		ModelIDProvider: modelIDWatcher,
+		EnableSubresourceAuthorization: enableSubresourceAuthorization,
+		Client:                         localMgr.GetClient(),
+		Scheme:                         localMgr.GetScheme(),
+		FgaClient:                      fgaClient,
+		StoreID:                        openfgaStoreID,
+		EventRecorder:                  localMgr.GetEventRecorderFor("role-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
+		ModelIDProvider:                modelIDWatcher,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller Role: %w", err)
 	}
 
 	if err = (&controller.PolicyBindingReconciler{
-		Client:                  localMgr.GetClient(),
-		Scheme:                  localMgr.GetScheme(),
-		FgaClient:               fgaClient,
-		StoreID:                 openfgaStoreID,
-		EventRecorder:           localMgr.GetEventRecorderFor("policybinding-controller"),
-		ModelIDProvider:         modelIDWatcher,
-		MaxConcurrentReconciles: policyBindingMaxConcurrentReconciles,
+		EnableSubresourceAuthorization: enableSubresourceAuthorization,
+		Client:                         localMgr.GetClient(),
+		Scheme:                         localMgr.GetScheme(),
+		FgaClient:                      fgaClient,
+		StoreID:                        openfgaStoreID,
+		EventRecorder:                  localMgr.GetEventRecorderFor("policybinding-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
+		ModelIDProvider:                modelIDWatcher,
+		MaxConcurrentReconciles:        policyBindingMaxConcurrentReconciles,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller PolicyBinding: %w", err)
 	}
@@ -349,7 +354,7 @@ func runManager(
 		Scheme:        localMgr.GetScheme(),
 		FGAClient:     fgaClient,
 		FGAStoreID:    openfgaStoreID,
-		EventRecorder: localMgr.GetEventRecorderFor("resourceownerhierarchy-controller"),
+		EventRecorder: localMgr.GetEventRecorderFor("resourceownerhierarchy-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller ResourceOwnerHierarchy: %w", err)
 	}
@@ -369,13 +374,14 @@ func runManager(
 	}
 
 	if err = (&controller.AuthorizationModelReconciler{
-		Client:             localMgr.GetClient(),
-		Scheme:             localMgr.GetScheme(),
-		FGAClient:          fgaClient,
-		FGAStoreID:         openfgaStoreID,
-		ConfigMapNamespace: configmapNamespace,
-		ConfigMapName:      configmapName,
-		ConfigMapClient:    configMapClient,
+		EnableSubresourceAuthorization: enableSubresourceAuthorization,
+		Client:                         localMgr.GetClient(),
+		Scheme:                         localMgr.GetScheme(),
+		FGAClient:                      fgaClient,
+		FGAStoreID:                     openfgaStoreID,
+		ConfigMapNamespace:             configmapNamespace,
+		ConfigMapName:                  configmapName,
+		ConfigMapClient:                configMapClient,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller AuthorizationModel: %w", err)
 	}
@@ -385,7 +391,7 @@ func runManager(
 		Scheme:          localMgr.GetScheme(),
 		FgaClient:       fgaClient,
 		StoreID:         openfgaStoreID,
-		EventRecorder:   localMgr.GetEventRecorderFor("groupmembership-controller"),
+		EventRecorder:   localMgr.GetEventRecorderFor("groupmembership-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
 		ModelIDProvider: modelIDWatcher,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller GroupMembership: %w", err)
@@ -432,7 +438,7 @@ func runManager(
 	// Run the provider, which calls Engage to register the cluster with mcMgr.
 	setupLog.Info("starting cluster provider")
 	g.Go(func() error {
-		return ignoreCanceled(provider.Run(ctx, mcMgr))
+		return ignoreCanceled(provider.Start(ctx, mcMgr))
 	})
 
 	setupLog.Info("starting multicluster manager")
@@ -449,7 +455,7 @@ func runManager(
 
 type runnableProvider interface {
 	multicluster.Provider
-	Run(context.Context, mcmanager.Manager) error
+	Start(context.Context, multicluster.Aware) error
 }
 
 // localManagerRunnable starts the local manager only after the primary
@@ -465,24 +471,9 @@ func (r *localManagerRunnable) Start(ctx context.Context) error {
 	return r.localMgr.Start(ctx)
 }
 
-func (r *localManagerRunnable) Engage(_ context.Context, _ string, _ cluster.Cluster) error {
+func (r *localManagerRunnable) Engage(_ context.Context, _ multicluster.ClusterName, _ cluster.Cluster) error {
 	// No-op: the local manager does not manage project clusters.
 	return nil
-}
-
-// Needed until we contribute the patch in the following PR again (need to sign CLA):
-//
-//	See: https://github.com/kubernetes-sigs/multicluster-runtime/pull/18
-type wrappedSingleClusterProvider struct {
-	multicluster.Provider
-	cluster cluster.Cluster
-}
-
-func (p *wrappedSingleClusterProvider) Run(ctx context.Context, mgr mcmanager.Manager) error {
-	if err := mgr.Engage(ctx, "single", p.cluster); err != nil {
-		return err
-	}
-	return p.Provider.(runnableProvider).Run(ctx, mgr)
 }
 
 func initializeClusterDiscovery(
@@ -493,10 +484,7 @@ func initializeClusterDiscovery(
 	runnables = append(runnables, deploymentCluster)
 	switch serverConfig.Discovery.Mode {
 	case milomulticluster.ProviderSingle:
-		provider = &wrappedSingleClusterProvider{
-			Provider: mcsingle.New("single", deploymentCluster),
-			cluster:  deploymentCluster,
-		}
+		provider = mcsingle.New("single", deploymentCluster)
 
 	case milomulticluster.ProviderMilo:
 		discoveryRestConfig, err := serverConfig.Discovery.DiscoveryRestConfig()

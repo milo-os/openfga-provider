@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 
+	"go.miloapis.com/auth-provider-openfga/internal/permissions"
+
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
 )
 
@@ -37,7 +39,7 @@ type resourceGraphNode struct {
 //
 // An error will be returned if no root resources were found in the hierarchy. A
 // root resource is defined as a resource with no parent resources.
-func getResourceGraph(protectedResources []iamdatumapiscomv1alpha1.ProtectedResource) (*resourceGraphNode, error) {
+func getResourceGraph(protectedResources []iamdatumapiscomv1alpha1.ProtectedResource, enableSubresources ...bool) (*resourceGraphNode, error) {
 	if len(protectedResources) == 0 {
 		return &resourceGraphNode{ResourceType: TypeRoot}, nil // Return a root node even if no protected resources
 	}
@@ -52,6 +54,9 @@ func getResourceGraph(protectedResources []iamdatumapiscomv1alpha1.ProtectedReso
 	}{}
 
 	for _, pr := range protectedResources {
+		if pr.DeletionTimestamp != nil {
+			continue
+		}
 		if pr.Spec.ServiceRef.Name == "" {
 			fmt.Printf("Warning: ProtectedResource %s has empty ServiceRef.Name, cannot be added to graph\n", pr.Name)
 			continue
@@ -137,7 +142,7 @@ func getResourceGraph(protectedResources []iamdatumapiscomv1alpha1.ProtectedReso
 		if !ok {
 			return nil, fmt.Errorf("root resource %s not found in processed map during graph construction", fqResourceType)
 		}
-		node, err := getResourceGraphNode(fqResourceType, resourceData.res, resources, directChildren, make(map[string]bool))
+		node, err := getResourceGraphNode(fqResourceType, resourceData.res, resources, directChildren, make(map[string]bool), len(enableSubresources) > 0 && enableSubresources[0])
 		if err != nil {
 			return nil, fmt.Errorf("could not get root graph node for %s: %v", fqResourceType, err)
 		}
@@ -160,6 +165,7 @@ func getResourceGraphNode(
 	},
 	directChildren map[string][]string,
 	visited map[string]bool, // To detect cycles during recursion
+	enableSubresources bool,
 ) (*resourceGraphNode, error) {
 	if visited[fqResourceType] {
 		return nil, fmt.Errorf("cycle detected: resource %s already visited in current path", fqResourceType)
@@ -183,7 +189,7 @@ func getResourceGraphNode(
 			newVisited[k] = v
 		}
 
-		childNode, err := getResourceGraphNode(childFQN, childData.res, allResources, directChildren, newVisited)
+		childNode, err := getResourceGraphNode(childFQN, childData.res, allResources, directChildren, newVisited, enableSubresources)
 		if err != nil {
 			// If cycle detected for a child, it might be an issue with graph structure.
 			// For now, we report error. Depending on requirements, might skip child or handle differently.
@@ -215,14 +221,7 @@ func getResourceGraphNode(
 		return nil, fmt.Errorf("invalid fully qualified type for resource, expected format `<service_apigroup>/<Kind>`: type %s", fqResourceType)
 	}
 
-	serviceSpecificAPIGroupFromFQN := resourceTypeParts[0]
-	for _, permission := range resourceSpec.Permissions {
-		if resourceSpec.Plural == "" { // Guard against empty Plural name
-			fmt.Printf("Warning: Resource %s has an empty Plural name, skipping permission '%s'\n", fqResourceType, permission)
-			continue
-		}
-		node.DirectPermissions = append(node.DirectPermissions, fmt.Sprintf("%s/%s.%s", serviceSpecificAPIGroupFromFQN, resourceSpec.Plural, permission))
-	}
+	node.DirectPermissions = permissions.Enumerate(resourceSpec, enableSubresources)
 	sort.Strings(node.DirectPermissions)
 
 	return node, nil
