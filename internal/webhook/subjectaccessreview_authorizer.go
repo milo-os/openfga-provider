@@ -590,9 +590,12 @@ func (o *SubjectAccessReviewAuthorizer) buildResourceObject(ctx context.Context,
 		return "", fmt.Errorf("failed to get protected resource: %w", err)
 	}
 
-	// Specific resource operations — resolve to the named instance.
+	// Named subresources belong to the existing instance, including create
+	// operations such as pods/exec or serviceaccounts/token. Preserve legacy
+	// collection handling for base resources and when the feature is disabled.
+	isNamedSubresource := o.EnableSubresourceAuthorization && attributes.GetSubresource() != "" && attributes.GetName() != ""
 	isCollectionOp := slices.Contains([]string{"list", "create", "watch"}, attributes.GetVerb()) || attributes.GetName() == ""
-	if !isCollectionOp {
+	if isNamedSubresource || !isCollectionOp {
 		return fmt.Sprintf("%s/%s:%s", protectedResource.Spec.ServiceRef.Name, protectedResource.Spec.Kind, attributes.GetName()), nil
 	}
 
