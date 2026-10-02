@@ -8,7 +8,7 @@ import (
 )
 
 func TestPermissionIdentity(t *testing.T) {
-	for _, value := range []string{"test.example/widgets.patch", "test.example/widgets/status.patch", "core.miloapis.com/pods/log.get", "test.example/widgets.custom.verb"} {
+	for _, value := range []string{"test.example/widgets.patch", "test.example/widgets/status.patch", "core.miloapis.com/pods/log.get", "test.example/widgets.custom.verb", "test.example/widgets.custom/action"} {
 		p, ok := Parse(value)
 		require.True(t, ok, value)
 		require.Equal(t, value, p.String())

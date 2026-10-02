@@ -19,7 +19,7 @@ func TestSubresourceRoleValidationAndRegistrationRemoval(t *testing.T) {
 	parent := &iam.Role{ObjectMeta: metav1.ObjectMeta{Name: "status-writer", Namespace: "default"}, Spec: iam.RoleSpec{IncludedPermissions: []string{permission}}}
 	inheriting := &iam.Role{ObjectMeta: metav1.ObjectMeta{Name: "inherited-writer", Namespace: "default"}, Spec: iam.RoleSpec{InheritedRoles: []iam.ScopedRoleReference{{Name: parent.Name}}}}
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(parent, inheriting).Build()
-	pr := iam.ProtectedResource{Spec: iam.ProtectedResourceSpec{ServiceRef: iam.ServiceReference{Name: "test.example"}, Plural: "widgets", Kind: "Widget", Permissions: []string{"patch", "custom.verb"}, Subresources: []iam.SubresourceDefinition{{Name: "status", Permissions: []string{"patch"}}}}}
+	pr := iam.ProtectedResource{Spec: iam.ProtectedResourceSpec{ServiceRef: iam.ServiceReference{Name: "test.example"}, Plural: "widgets", Kind: "Widget", Permissions: []string{"patch", "custom.verb", "custom/action"}, Subresources: []iam.SubresourceDefinition{{Name: "status", Permissions: []string{"patch"}}}}}
 	for _, enabled := range []bool{false, true} {
 		r := RoleReconciler{Client: cli, EnableSubresourceAuthorization: enabled}
 		invalid, err := r.validateRolePermissions(ctx, parent, []iam.ProtectedResource{pr}, []string{permission})
@@ -29,7 +29,7 @@ func TestSubresourceRoleValidationAndRegistrationRemoval(t *testing.T) {
 		} else {
 			require.Equal(t, []string{permission}, invalid)
 		}
-		invalid, err = r.validateRolePermissions(ctx, parent, []iam.ProtectedResource{pr}, []string{"test.example/widgets.custom.verb"})
+		invalid, err = r.validateRolePermissions(ctx, parent, []iam.ProtectedResource{pr}, []string{"test.example/widgets.custom.verb", "test.example/widgets.custom/action"})
 		require.NoError(t, err)
 		require.Empty(t, invalid)
 		removed := pr.DeepCopy()
