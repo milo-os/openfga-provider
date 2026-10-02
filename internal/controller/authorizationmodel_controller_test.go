@@ -36,8 +36,8 @@ func protectedResourceFixture(generation, observedGeneration int64, deleting boo
 }
 
 // TestProtectedResourceEventPredicate_Create covers the CreateFunc branch: a
-// both real creates and bootstrap replays reconcile so process configuration
-// changes rebuild the model even when the object generation is unchanged.
+// real creates and unfinished bootstrap replays reconcile; fully observed
+// replays are filtered because startup has its own model-wide request.
 func TestProtectedResourceEventPredicate_Create(t *testing.T) {
 	pred := protectedResourceEventPredicate()
 
@@ -54,10 +54,10 @@ func TestProtectedResourceEventPredicate_Create(t *testing.T) {
 			want:            true,
 		},
 		{
-			name:            "replay of a fully synced object reconciles feature configuration",
+			name:            "replay of a fully synced object is filtered",
 			isInInitialList: true,
 			pr:              protectedResourceFixture(2, 2, false, true),
-			want:            true,
+			want:            false,
 		},
 		{
 			name:            "replay with stale ObservedGeneration reconciles",

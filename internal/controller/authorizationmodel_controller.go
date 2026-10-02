@@ -14,14 +14,17 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const (
@@ -95,10 +98,9 @@ type AuthorizationModelReconciler struct {
 	// controller uses a remote KUBECONFIG (e.g. for a Milo control plane) but
 	// ConfigMap operations need to target the local workload cluster. When nil,
 	// the primary Client is used as a fallback.
-	ConfigMapClient  client.Client
-	modelBuilder     *openfga.AuthorizationModelReconciler
-	modelInitialized bool
-	Finalizers       finalizer.Finalizers
+	ConfigMapClient client.Client
+	modelBuilder    *openfga.AuthorizationModelReconciler
+	Finalizers      finalizer.Finalizers
 }
 
 //+kubebuilder:rbac:groups=iam.miloapis.com,resources=protectedresources,verbs=get;list;watch;update;patch
@@ -112,6 +114,13 @@ type AuthorizationModelReconciler struct {
 // orchestrates fetching the resource, handling its deletion, ensuring
 // finalizers, or reconciling its active state with the OpenFGA model.
 func (r *AuthorizationModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// The startup source uses an empty name, which cannot identify a real
+	// ProtectedResource. Rebuild independently of resource generations so flag
+	// changes take effect even when the initial list is empty or fully observed.
+	if req.Name == "" {
+		return ctrl.Result{}, r.rebuildAuthorizationModel(ctx)
+	}
+
 	log := logf.FromContext(ctx).WithValues("controller", "AuthorizationModelReconciler", "trigger", req.NamespacedName)
 	log.Info("Reconciling IAM Authorization Model due to ProtectedResource change")
 
@@ -155,7 +164,7 @@ func (r *AuthorizationModelReconciler) reconcileProtectedResource(ctx context.Co
 	log := logf.FromContext(ctx).WithValues("protectedResourceName", triggeringPR.Name, "operation", "reconcileProtectedResource")
 
 	// Already reconciled at this generation
-	if r.modelInitialized && triggeringPR.Status.ObservedGeneration == triggeringPR.Generation {
+	if triggeringPR.Status.ObservedGeneration == triggeringPR.Generation {
 		log.V(1).Info("ProtectedResource already observed at current generation, skipping authorization model reconciliation")
 		return ctrl.Result{}, nil
 	}
@@ -165,22 +174,47 @@ func (r *AuthorizationModelReconciler) reconcileProtectedResource(ctx context.Co
 	// Capture the old status before making any changes
 	oldStatus := triggeringPR.Status.DeepCopy()
 
-	var prList iamdatumapiscomv1alpha1.ProtectedResourceList
-	if err := r.List(ctx, &prList); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to list ProtectedResources: %w", err)
+	if err := r.rebuildAuthorizationModel(ctx); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	if err := r.modelBuilder.ReconcileAuthorizationModel(ctx, prList.Items); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to reconcile IAM authorization model: %w", err)
-	}
-
-	r.modelInitialized = true
 	log.Info("Successfully reconciled IAM authorization model.")
 	if err := r.updateTriggeringPRStatus(ctx, triggeringPR, oldStatus, true, "IAMSystemConfigured", "Resource is configured to be protected by the IAM system."); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update ProtectedResource status: %w", err)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// rebuildAuthorizationModel uses the complete cached resource list. Controller
+// workers start only after their informer sources have synced, including the
+// startup request. Errors are retried by the controller's regular workqueue.
+func (r *AuthorizationModelReconciler) rebuildAuthorizationModel(ctx context.Context) error {
+	var prList iamdatumapiscomv1alpha1.ProtectedResourceList
+	if err := r.List(ctx, &prList); err != nil {
+		return fmt.Errorf("failed to list ProtectedResources: %w", err)
+	}
+	active := make([]iamdatumapiscomv1alpha1.ProtectedResource, 0, len(prList.Items))
+	for _, pr := range prList.Items {
+		if pr.DeletionTimestamp == nil {
+			active = append(active, pr)
+		}
+	}
+	if err := r.modelBuilder.ReconcileAuthorizationModel(ctx, active); err != nil {
+		return fmt.Errorf("failed to reconcile IAM authorization model: %w", err)
+	}
+	return nil
+}
+
+// authorizationModelStartupSource queues exactly one model-wide reconcile per
+// controller startup, without replaying every already observed resource. It
+// shares the controller queue so model writes, retries, and shutdown use the
+// same lifecycle as resource reconciles.
+func authorizationModelStartupSource() source.Source {
+	return source.Func(func(_ context.Context, queue workqueue.TypedRateLimitingInterface[ctrl.Request]) error {
+		queue.Add(ctrl.Request{})
+		return nil
+	})
 }
 
 // updateTriggeringPRStatus updates the status subresource of a given
@@ -226,15 +260,19 @@ func (r *AuthorizationModelReconciler) updateTriggeringPRStatus(
 	return nil
 }
 
-// protectedResourceEventPredicate reconciles startup replays to account for
-// process configuration changes, and spec/deletion updates thereafter.
+// protectedResourceEventPredicate filters fully observed initial-list replays.
+// Startup configuration changes are handled by one model-wide request instead.
 func protectedResourceEventPredicate() predicate.Predicate {
 	return predicate.Funcs{
-		// Replay on startup: feature settings can change without any resource
-		// generation changing. The first reconcile rebuilds the complete model.
 		CreateFunc: func(e event.CreateEvent) bool {
-			_, ok := e.Object.(*iamdatumapiscomv1alpha1.ProtectedResource)
-			return ok
+			pr, ok := e.Object.(*iamdatumapiscomv1alpha1.ProtectedResource)
+			if !ok {
+				return false
+			}
+			return !e.IsInInitialList ||
+				pr.Status.ObservedGeneration != pr.Generation ||
+				pr.GetDeletionTimestamp() != nil ||
+				!controllerutil.ContainsFinalizer(pr, protectedResourceFinalizerKey)
 		},
 
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -297,6 +335,9 @@ func (r *AuthorizationModelReconciler) SetupWithManager(mgr ctrl.Manager) error 
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&iamdatumapiscomv1alpha1.ProtectedResource{}, builder.WithPredicates(protectedResourceEventPredicate())).
+		WatchesRawSource(authorizationModelStartupSource()).
+		// Every request rewrites a shared model; never race model snapshots.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("authorizationmodel_controller").
 		Complete(r)
 }
