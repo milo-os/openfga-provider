@@ -84,14 +84,14 @@ func (r *PolicyReconciler) DeletePolicy(ctx context.Context, binding iamdatumapi
 		return nil
 	}
 
-	_, err = r.Client.Write(ctx, &openfgav1.WriteRequest{
+	writeRequest := &openfgav1.WriteRequest{
 		StoreId:              r.StoreID,
 		AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
 		Deletes: &openfgav1.WriteRequestDeletes{
 			TupleKeys: convertTuplesForDelete(toDelete),
 		},
-	})
-	if err != nil {
+	}
+	if err := writeWithModelTransitionRetry(ctx, r.Client, writeRequest, r.ModelIDProvider); err != nil {
 		return fmt.Errorf("failed to delete policy tuples: %w", err)
 	}
 
@@ -185,8 +185,7 @@ func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatum
 		return nil
 	}
 
-	_, err = r.Client.Write(ctx, writeReq)
-	if err != nil {
+	if err := writeWithModelTransitionRetry(ctx, r.Client, writeReq, r.ModelIDProvider); err != nil {
 		return fmt.Errorf("failed to write permission tuples: %w", err)
 	}
 

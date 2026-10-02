@@ -156,6 +156,16 @@ func (w *AuthorizationModelIDWatcher) GetModelID() string {
 	return v.(string)
 }
 
+// SetModelID updates the cached model ID immediately after a caller verifies
+// that OpenFGA has published the latest model. The ConfigMap watch will observe
+// the same value shortly afterward and become a no-op.
+func (w *AuthorizationModelIDWatcher) SetModelID(modelID string) {
+	if modelID == "" || w.GetModelID() == modelID {
+		return
+	}
+	w.modelID.Store(modelID)
+}
+
 // handleConfigMap inspects a raw informer event object. If it is the
 // openfga-authorization-model ConfigMap it extracts the model ID and stores it.
 func (w *AuthorizationModelIDWatcher) handleConfigMap(obj interface{}) {
