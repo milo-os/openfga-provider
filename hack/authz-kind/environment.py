@@ -266,7 +266,8 @@ def main():
     os.chdir(ROOT)
     try:
         if args.command == 'down':
-            run('kind', 'delete', 'cluster', '--name', CLUSTER)
+            run('kind', 'delete', 'cluster', '--name', CLUSTER,
+                '--kubeconfig', STATE / 'kind.kubeconfig')
         else:
             globals()[args.command]()
     except Exception:
