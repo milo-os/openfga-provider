@@ -32,8 +32,10 @@ const (
 )
 
 type AuthorizationModelReconciler struct {
-	StoreID string
-	OpenFGA openfgav1.OpenFGAServiceClient
+	// EnableSubresourceAuthorization enables explicit, independently registered subresource permissions.
+	EnableSubresourceAuthorization bool
+	StoreID                        string
+	OpenFGA                        openfgav1.OpenFGAServiceClient
 
 	// K8sClient is used to create/update the ConfigMap that holds the current
 	// authorization model ID. When nil, the ConfigMap write is skipped.
@@ -170,8 +172,7 @@ func (r *AuthorizationModelReconciler) ReconcileAuthorizationModel(ctx context.C
 		// a fresh cluster where the ConfigMap was never created).
 		if r.K8sClient != nil && r.Namespace != "" && currentAuthorizationModel.GetId() != "" {
 			if cmErr := r.writeModelIDToConfigMap(ctx, currentAuthorizationModel.GetId()); cmErr != nil {
-				log.Error(cmErr, "failed to write authorization model ID to ConfigMap (no-op path)",
-					"model_id", currentAuthorizationModel.GetId())
+				return fmt.Errorf("failed to publish authorization model ID: %w", cmErr)
 			}
 		}
 		return nil
@@ -197,8 +198,7 @@ func (r *AuthorizationModelReconciler) ReconcileAuthorizationModel(ctx context.C
 
 	if r.K8sClient != nil && r.Namespace != "" && writeResp.GetAuthorizationModelId() != "" {
 		if cmErr := r.writeModelIDToConfigMap(ctx, writeResp.GetAuthorizationModelId()); cmErr != nil {
-			log.Error(cmErr, "failed to write authorization model ID to ConfigMap",
-				"model_id", writeResp.GetAuthorizationModelId())
+			return fmt.Errorf("failed to publish authorization model ID: %w", cmErr)
 		}
 	}
 
@@ -278,7 +278,7 @@ func (r *AuthorizationModelReconciler) createExpectedAuthorizationModel(protecte
 		return sortedPRs[i].Name < sortedPRs[j].Name
 	})
 
-	resourceGraph, err := getResourceGraph(sortedPRs)
+	resourceGraph, err := getResourceGraph(sortedPRs, r.EnableSubresourceAuthorization)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get resource graph: %v", err)
 	}

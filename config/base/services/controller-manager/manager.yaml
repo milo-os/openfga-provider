@@ -37,6 +37,7 @@ spec:
           - --metrics-bind-address=:8080
           - --openfga-api-url=$(OPENFGA_API_URL)
           - --openfga-store-id=$(OPENFGA_STORE_ID)
+          - --enable-subresource-authorization=$(ENABLE_SUBRESOURCE_AUTHORIZATION)
           - --leader-election-namespace=$(LEADER_ELECTION_NAMESPACE)
           - --leader-election-id=$(LEADER_ELECTION_ID)
           - --leader-election-lease-duration=$(LEADER_ELECTION_LEASE_DURATION)
@@ -75,6 +76,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: ENABLE_SUBRESOURCE_AUTHORIZATION
+          value: "false"
         - name: FEATURE_GATES
           value: ""
         - name: OPENFGA_CONTROLLER_MANAGER_CONFIG_PATH

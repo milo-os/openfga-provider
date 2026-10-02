@@ -45,10 +45,13 @@ func NewProtectedResourceCache(ctx context.Context, mgr ctrl.Manager) (*Protecte
 			}
 			c.upsert(pr)
 		},
-		UpdateFunc: func(_, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj interface{}) {
 			pr, ok := newObj.(*iamv1alpha1.ProtectedResource)
 			if !ok {
 				return
+			}
+			if old, ok := oldObj.(*iamv1alpha1.ProtectedResource); ok && cacheKey(old.Spec.ServiceRef.Name, old.Spec.Plural) != cacheKey(pr.Spec.ServiceRef.Name, pr.Spec.Plural) {
+				c.delete(old)
 			}
 			c.upsert(pr)
 		},

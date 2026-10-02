@@ -86,6 +86,8 @@ func (e *MissingNamespaceError) Error() string {
 // desired state specified in PolicyBinding custom resources. This involves validating references to Kubernetes
 // resources, managing finalizers for cleanup, and creating/deleting tuples in an OpenFGA store.
 type PolicyBindingReconciler struct {
+	// EnableSubresourceAuthorization enables explicit, independently registered subresource permissions.
+	EnableSubresourceAuthorization bool
 	client.Client
 	Scheme        *runtime.Scheme
 	RESTMapper    meta.RESTMapper
@@ -152,6 +154,14 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if !isValid {
+		if r.EnableSubresourceAuthorization {
+			// Registration removal must also remove previously programmed tuples;
+			// otherwise recreating the registration can resurrect a stale grant.
+			policyReconciler := openfga.PolicyReconciler{EnableSubresourceAuthorization: true, StoreID: r.StoreID, Client: r.FgaClient, K8sClient: r.Client, ModelIDProvider: r.ModelIDProvider}
+			if err := policyReconciler.DeletePolicy(ctx, *policyBinding); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to revoke invalid resource selector: %w", err)
+			}
+		}
 		// Resource selector validation failed cleanly. The reconcileResourceSelectorValidation function has set
 		// TargetValid=False and updated status. Set Ready condition to False and stop reconciliation.
 		meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
@@ -447,10 +457,11 @@ func (r *PolicyBindingReconciler) reconcileSubjectValidation(ctx context.Context
 func (r *PolicyBindingReconciler) reconcileOpenFGAPolicy(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	policyReconciler := openfga.PolicyReconciler{
-		StoreID:         r.StoreID,
-		Client:          r.FgaClient,
-		K8sClient:       r.Client,
-		ModelIDProvider: r.ModelIDProvider,
+		EnableSubresourceAuthorization: r.EnableSubresourceAuthorization,
+		StoreID:                        r.StoreID,
+		Client:                         r.FgaClient,
+		K8sClient:                      r.Client,
+		ModelIDProvider:                r.ModelIDProvider,
 	}
 
 	if err := policyReconciler.ReconcilePolicy(ctx, *policyBinding); err != nil {
@@ -769,10 +780,14 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForProtectedResourceChang
 		"kindDefined", protectedResource.Spec.Kind)
 
 	policyBindings := &iamdatumapiscomv1alpha1.PolicyBindingList{}
-	targetKindKey := fmt.Sprintf("%s/%s", protectedResource.Spec.ServiceRef.Name, protectedResource.Spec.Kind)
-	if err := r.List(ctx, policyBindings, client.MatchingFields{
-		openfga.TargetKindIndexField: targetKindKey,
-	}); err != nil {
+	// A registration changes permissions on ancestors and Root as well as
+	// on the registered type. Reconcile every binding so removed permissions
+	// cannot remain in baked tuples on parent objects.
+	var options []client.ListOption
+	if !r.EnableSubresourceAuthorization {
+		options = append(options, client.MatchingFields{openfga.TargetKindIndexField: fmt.Sprintf("%s/%s", protectedResource.Spec.ServiceRef.Name, protectedResource.Spec.Kind)})
+	}
+	if err := r.List(ctx, policyBindings, options...); err != nil {
 		log.Error(err, "failed to list PolicyBindings for ProtectedResource change")
 		return []reconcile.Request{}
 	}
@@ -871,10 +886,11 @@ func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		fgaClient: r.FgaClient,
 		storeID:   r.StoreID,
 		policyReconciler: &openfga.PolicyReconciler{
-			StoreID:         r.StoreID,
-			Client:          r.FgaClient,
-			K8sClient:       r.Client,
-			ModelIDProvider: r.ModelIDProvider,
+			EnableSubresourceAuthorization: r.EnableSubresourceAuthorization,
+			StoreID:                        r.StoreID,
+			Client:                         r.FgaClient,
+			K8sClient:                      r.Client,
+			ModelIDProvider:                r.ModelIDProvider,
 		},
 	}); err != nil {
 		return fmt.Errorf("failed to register policy binding finalizer: %w", err)

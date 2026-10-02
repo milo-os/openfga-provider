@@ -10,6 +10,7 @@ import (
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"go.miloapis.com/auth-provider-openfga/internal/openfga"
+	"go.miloapis.com/auth-provider-openfga/internal/permissions"
 	iamv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -38,8 +39,9 @@ var serviceNameMapping = map[string]string{
 var _ authorizer.Authorizer = &SubjectAccessReviewAuthorizer{}
 
 type SubjectAccessReviewAuthorizer struct {
-	FGAClient  openfgav1.OpenFGAServiceClient
-	FGAStoreID string
+	EnableSubresourceAuthorization bool
+	FGAClient                      openfgav1.OpenFGAServiceClient
+	FGAStoreID                     string
 	// ModelIDWatcher provides the current authorization model ID. When the
 	// returned ID is non-empty OpenFGA skips its internal model lookup (one DB
 	// read saved per Check call). If the watcher returns an empty string
@@ -51,21 +53,23 @@ type SubjectAccessReviewAuthorizer struct {
 
 // Config holds the configuration for creating a SubjectAccessReview webhook
 type Config struct {
-	FGAClient              openfgav1.OpenFGAServiceClient
-	FGAStoreID             string
-	ModelIDWatcher         *AuthorizationModelIDWatcher
-	ProtectedResourceCache *ProtectedResourceCache
-	DiscoveryClient        discovery.DiscoveryInterface
+	EnableSubresourceAuthorization bool
+	FGAClient                      openfgav1.OpenFGAServiceClient
+	FGAStoreID                     string
+	ModelIDWatcher                 *AuthorizationModelIDWatcher
+	ProtectedResourceCache         *ProtectedResourceCache
+	DiscoveryClient                discovery.DiscoveryInterface
 }
 
 // NewSubjectAccessReviewWebhook creates a new SubjectAccessReview authorization webhook
 func NewSubjectAccessReviewWebhook(config Config) *Webhook {
 	authorizer := &SubjectAccessReviewAuthorizer{
-		FGAClient:              config.FGAClient,
-		FGAStoreID:             config.FGAStoreID,
-		ModelIDWatcher:         config.ModelIDWatcher,
-		ProtectedResourceCache: config.ProtectedResourceCache,
-		DiscoveryClient:        config.DiscoveryClient,
+		EnableSubresourceAuthorization: config.EnableSubresourceAuthorization,
+		FGAClient:                      config.FGAClient,
+		FGAStoreID:                     config.FGAStoreID,
+		ModelIDWatcher:                 config.ModelIDWatcher,
+		ProtectedResourceCache:         config.ProtectedResourceCache,
+		DiscoveryClient:                config.DiscoveryClient,
 	}
 	return NewAuthorizerWebhook(authorizer)
 }
@@ -204,6 +208,9 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 	if !permExists {
 		permission := o.buildPermissionString(attributes)
 		logf.FromContext(ctx).Info("permission not found", "attributes", attributes, "permission", permission)
+		if o.EnableSubresourceAuthorization {
+			return authorizer.DecisionDeny, fmt.Sprintf("permission '%s' not registered", permission), nil
+		}
 		return authorizer.DecisionDeny, "", fmt.Errorf("permission '%s' not registered", permission)
 	}
 
@@ -583,9 +590,12 @@ func (o *SubjectAccessReviewAuthorizer) buildResourceObject(ctx context.Context,
 		return "", fmt.Errorf("failed to get protected resource: %w", err)
 	}
 
-	// Specific resource operations — resolve to the named instance.
+	// Named subresources belong to the existing instance, including create
+	// operations such as pods/exec or serviceaccounts/token. Preserve legacy
+	// collection handling for base resources and when the feature is disabled.
+	isNamedSubresource := o.EnableSubresourceAuthorization && attributes.GetSubresource() != "" && attributes.GetName() != ""
 	isCollectionOp := slices.Contains([]string{"list", "create", "watch"}, attributes.GetVerb()) || attributes.GetName() == ""
-	if !isCollectionOp {
+	if isNamedSubresource || !isCollectionOp {
 		return fmt.Sprintf("%s/%s:%s", protectedResource.Spec.ServiceRef.Name, protectedResource.Spec.Kind, attributes.GetName()), nil
 	}
 
@@ -608,8 +618,6 @@ func (o *SubjectAccessReviewAuthorizer) validatePermissionWithServiceDefaulting(
 
 	apiGroup := o.getEffectiveAPIGroup(attributes)
 	resource := attributes.GetResource()
-	verb := attributes.GetVerb()
-
 	stepStart := time.Now()
 	pr, ok := o.ProtectedResourceCache.GetByAPIGroupAndResource(apiGroup, resource)
 	duration := time.Since(stepStart)
@@ -623,7 +631,11 @@ func (o *SubjectAccessReviewAuthorizer) validatePermissionWithServiceDefaulting(
 			"resource", resource,
 			"duration", duration,
 		)
-		return slices.Contains(pr.Spec.Permissions, verb), nil
+		if !o.EnableSubresourceAuthorization {
+			return slices.Contains(pr.Spec.Permissions, attributes.GetVerb()), nil
+		}
+		permission, valid := permissions.Parse(o.buildPermissionString(attributes))
+		return valid && pr.DeletionTimestamp == nil && permissions.Defined(pr.Spec, permission, o.EnableSubresourceAuthorization), nil
 	}
 
 	authzK8sAPICallsTotal.WithLabelValues("protectedresources", "cache_get", "miss").Inc()
@@ -653,7 +665,11 @@ func (o *SubjectAccessReviewAuthorizer) buildPermissionString(attributes authori
 	apiGroup := o.getEffectiveAPIGroup(attributes)
 	resource := attributes.GetResource()
 	verb := attributes.GetVerb()
-	return fmt.Sprintf("%s/%s.%s", apiGroup, resource, verb)
+	subresource := ""
+	if o.EnableSubresourceAuthorization {
+		subresource = attributes.GetSubresource()
+	}
+	return (permissions.Permission{APIGroup: apiGroup, Resource: resource, Subresource: subresource, Verb: verb}).String()
 }
 
 func (o *SubjectAccessReviewAuthorizer) buildParentResource(attributes authorizer.Attributes) (string, error) {

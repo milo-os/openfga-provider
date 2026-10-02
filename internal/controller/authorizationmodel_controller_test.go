@@ -36,8 +36,8 @@ func protectedResourceFixture(generation, observedGeneration int64, deleting boo
 }
 
 // TestProtectedResourceEventPredicate_Create covers the CreateFunc branch: a
-// real create must always pass; a replayed (bootstrap) create only passes
-// when there's still something for Reconcile to do.
+// real creates and unfinished bootstrap replays reconcile; fully observed
+// replays are filtered because startup has its own model-wide request.
 func TestProtectedResourceEventPredicate_Create(t *testing.T) {
 	pred := protectedResourceEventPredicate()
 
@@ -54,7 +54,7 @@ func TestProtectedResourceEventPredicate_Create(t *testing.T) {
 			want:            true,
 		},
 		{
-			name:            "replay of a fully synced object is skipped",
+			name:            "replay of a fully synced object is filtered",
 			isInInitialList: true,
 			pr:              protectedResourceFixture(2, 2, false, true),
 			want:            false,

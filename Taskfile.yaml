@@ -46,6 +46,26 @@ tasks:
       - task --list
     silent: true
 
+  dev:authz:up:
+    desc: Build local Milo/provider and start isolated test-infra kind authorization environment (flag defaults off)
+    cmds:
+      - python3 hack/authz-kind/environment.py up
+
+  dev:authz:build:
+    desc: Build both local revisions into images for the authorization environment
+    cmds:
+      - python3 hack/authz-kind/environment.py build
+
+  test:e2e:subresources:
+    desc: Exercise real end-user HTTP writes with the subresource authorization flag off and on
+    cmds:
+      - python3 test/e2e/subresources/run.py
+
+  dev:authz:down:
+    desc: Delete only the dedicated local authorization kind cluster
+    cmds:
+      - python3 hack/authz-kind/environment.py down
+
   # Development Tasks
   manifests:
     desc: Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects
@@ -190,8 +210,8 @@ tasks:
     cmds:
       - |
         set -e
-        echo "Loading image {{.IMG}} into kind cluster test-infra"
-        kind load docker-image {{.IMG}} --name test-infra
+        echo "Loading image {{.IMG}} into kind cluster {{.CLUSTER_NAME}}"
+        kind load docker-image {{.IMG}} --name {{.CLUSTER_NAME}}
 
   dev:deploy:
     desc: Deploy auth-provider-openfga to the development environment
