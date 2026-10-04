@@ -208,10 +208,15 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 	if !permExists {
 		permission := o.buildPermissionString(attributes)
 		logf.FromContext(ctx).Info("permission not found", "attributes", attributes, "permission", permission)
+		var reason string
+		var notRegisteredErr error
 		if o.EnableSubresourceAuthorization {
-			return authorizer.DecisionDeny, fmt.Sprintf("permission '%s' not registered", permission), nil
+			reason = fmt.Sprintf("permission '%s' not registered", permission)
+		} else {
+			notRegisteredErr = fmt.Errorf("permission '%s' not registered", permission)
 		}
-		return authorizer.DecisionDeny, "", fmt.Errorf("permission '%s' not registered", permission)
+		authzDecisionsTotal.WithLabelValues(decisionLabel(authorizer.DecisionDeny, notRegisteredErr), scope, attributes.GetAPIGroup(), reasonPermissionNotRegistered).Inc()
+		return authorizer.DecisionDeny, reason, notRegisteredErr
 	}
 
 	// Step 6: Build OpenFGA check request
@@ -296,7 +301,7 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 	resourceGroup := attributes.GetAPIGroup()
 
 	authzRequestDuration.WithLabelValues(decisionStr, scope, resourceGroup).Observe(totalDuration.Seconds())
-	authzDecisionsTotal.WithLabelValues(decisionStr, scope, resourceGroup).Inc()
+	authzDecisionsTotal.WithLabelValues(decisionStr, scope, resourceGroup, reasonOpenFGACheck).Inc()
 
 	span.SetAttributes(attribute.String("authz.decision", decisionStr))
 	if checkErr != nil {

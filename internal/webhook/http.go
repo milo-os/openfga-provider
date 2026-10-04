@@ -107,7 +107,7 @@ func (wh *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Record end-to-end metrics regardless of how the handler exits.
 	defer func() {
 		authzRequestDuration.WithLabelValues(decision, scope, resourceGroup).Observe(time.Since(start).Seconds())
-		authzDecisionsTotal.WithLabelValues(decision, scope, resourceGroup).Inc()
+		authzDecisionsTotal.WithLabelValues(decision, scope, resourceGroup, reasonHTTPRequest).Inc()
 	}()
 
 	if r.Body == nil {
