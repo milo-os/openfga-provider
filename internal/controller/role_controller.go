@@ -240,6 +240,7 @@ func (r *RoleReconciler) setDegradedCondition(ctx context.Context, role *iamdatu
 }
 
 // validateRolePermissions checks if all effective permissions in a role are validly defined by known ProtectedResources.
+// Declared subresource permissions stay valid when the flag is off; they are just not programmed.
 func (r *RoleReconciler) validateRolePermissions(ctx context.Context, role *iamdatumapiscomv1alpha1.Role, protectedResources []iamdatumapiscomv1alpha1.ProtectedResource, effectivePermissions []string) ([]string, error) {
 	log := logf.FromContext(ctx).WithValues("roleName", role.Name)
 	var invalidPermissions []string
@@ -254,7 +255,7 @@ func (r *RoleReconciler) validateRolePermissions(ctx context.Context, role *iamd
 
 		isPermissionDefined := false
 		for _, pr := range protectedResources {
-			if pr.DeletionTimestamp == nil && permissions.Defined(pr.Spec, permission, r.EnableSubresourceAuthorization) {
+			if pr.DeletionTimestamp == nil && permissions.Defined(pr.Spec, permission, true) {
 				isPermissionDefined = true
 				break
 			}
@@ -267,6 +268,20 @@ func (r *RoleReconciler) validateRolePermissions(ctx context.Context, role *iamd
 	// Ensure deterministic order for downstream comparison/logging
 	sort.Strings(invalidPermissions)
 	return invalidPermissions, nil
+}
+
+func (r *RoleReconciler) inertSubresourcePermissions(effectivePermissions []string) []string {
+	if r.EnableSubresourceAuthorization {
+		return nil
+	}
+	var inert []string
+	for _, permStr := range effectivePermissions {
+		if p, ok := permissions.Parse(permStr); ok && p.Subresource != "" {
+			inert = append(inert, permStr)
+		}
+	}
+	sort.Strings(inert)
+	return inert
 }
 
 // isRoleAffectedByProtectedResource checks if a role's effective permissions might be affected by a change
@@ -411,6 +426,8 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		permValidationCondition.Status = metav1.ConditionFalse
 		permValidationCondition.Reason = "InvalidPermissions"
 		permValidationCondition.Message = fmt.Sprintf("Role contains invalid/undefined permissions: %s", strings.Join(invalidPermissions, ", "))
+	} else if inert := r.inertSubresourcePermissions(effectivePermissions); len(inert) > 0 {
+		permValidationCondition.Message = fmt.Sprintf("All permissions validated successfully. Subresource authorization is disabled, so these permissions grant nothing: %s", strings.Join(inert, ", "))
 	}
 	meta.SetStatusCondition(&role.Status.Conditions, permValidationCondition)
 

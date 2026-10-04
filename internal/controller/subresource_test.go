@@ -24,11 +24,7 @@ func TestSubresourceRoleValidationAndRegistrationRemoval(t *testing.T) {
 		r := RoleReconciler{Client: cli, EnableSubresourceAuthorization: enabled}
 		invalid, err := r.validateRolePermissions(ctx, parent, []iam.ProtectedResource{pr}, []string{permission})
 		require.NoError(t, err)
-		if enabled {
-			require.Empty(t, invalid)
-		} else {
-			require.Equal(t, []string{permission}, invalid)
-		}
+		require.Empty(t, invalid)
 		invalid, err = r.validateRolePermissions(ctx, parent, []iam.ProtectedResource{pr}, []string{"test.example/widgets.custom.verb", "test.example/widgets.custom/action"})
 		require.NoError(t, err)
 		require.Empty(t, invalid)
