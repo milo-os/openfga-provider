@@ -20,12 +20,13 @@ var (
 
 	// authzDecisionsTotal counts authorization decisions by outcome, scope, and
 	// resource group. Use this to track decision distribution and error rates.
+	// reason names the recording path; only the authorizer records permission_not_registered.
 	authzDecisionsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "authz_decisions_total",
 			Help: "Total number of authorization decisions by outcome.",
 		},
-		[]string{"decision", "scope", "resource_group"},
+		[]string{"decision", "scope", "resource_group", "reason"},
 	)
 
 	// authzStepDuration measures the duration of individual steps within the
@@ -59,6 +60,12 @@ var (
 		},
 		[]string{"allowed", "error"},
 	)
+)
+
+const (
+	reasonHTTPRequest             = "http_request"
+	reasonOpenFGACheck            = "openfga_check"
+	reasonPermissionNotRegistered = "permission_not_registered"
 )
 
 func init() {
