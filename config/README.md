@@ -20,7 +20,8 @@ config/
 ├── components/                    # Optional Kustomize components
     ├── tls-certs/                 # TLS certificate configuration
     ├── prometheus-monitoring/     # Metrics and monitoring
-    └── network-policies/          # Network security policies
+    ├── network-policies/          # Network security policies
+    └── alerts/                    # Alert rules for authorization decisions
 
 ```
 
@@ -135,6 +136,25 @@ Provides network security isolation and access control.
 - ✅ Selective metrics access (namespaces with `metrics: enabled`)
 - ✅ Webhook traffic controls
 - ✅ HTTPS metrics port (8443) support
+
+### Alerts (`components/alerts/`)
+
+Ships a `PrometheusRule` that alerts when the authorization webhook refuses
+requests because their permission is missing from the authorization model. It
+needs the authz-webhook metrics scraped, for example by the `observability`
+component, and a rule evaluator that reads `PrometheusRule` objects.
+
+**Alerts:**
+- `AuthzPermissionNotRegistered`: 3 or more refusals for one API group in 15
+  minutes. [Runbook](../docs/runbooks/authz-permission-not-registered.md)
+- `AuthzDecisionReasonMissing`: the metric has carried no `reason` label for 30
+  minutes, so the first alert cannot fire.
+  [Runbook](../docs/runbooks/authz-decision-reason-missing.md)
+
+Both carry `team: platform` and `service: iam` for routing. The first skips
+`coordination.k8s.io`, `notification.miloapis.com` and
+`rbac.authorization.k8s.io`, which refuse a few requests an hour as a matter of
+course.
 
 ## Environment Configuration Patterns
 

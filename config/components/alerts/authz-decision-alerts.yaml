@@ -1,0 +1,60 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: authz-decision-alerts
+  labels:
+    app.kubernetes.io/name: authz-webhook
+    app.kubernetes.io/part-of: auth-provider-openfga
+spec:
+  groups:
+    - name: authz-decisions
+      rules:
+        - alert: AuthzPermissionNotRegistered
+          expr: |
+            sum by (resource_group) (
+              increase(authz_decisions_total{reason="permission_not_registered", resource_group!~"coordination.k8s.io|notification.miloapis.com|rbac.authorization.k8s.io"}[15m])
+            ) >= 3
+          for: 5m
+          labels:
+            severity: warning
+            service: iam
+            team: platform
+            expected_no_match: "true"
+          annotations:
+            summary: >-
+              Authorization is refusing {{ if $labels.resource_group }}{{ $labels.resource_group }}{{ else }}core API{{ end }}
+              requests because their permission is not registered
+            description: >-
+              The OpenFGA authorization webhook refused or failed
+              {{ $value | humanize }} requests for
+              {{ if $labels.resource_group }}{{ $labels.resource_group }}{{ else }}the core API group{{ end }}
+              in the last 15 minutes because the permission they need is
+              missing from the authorization model. Every caller gets a 403
+              whatever their role. The webhook logs each one as
+              "permission not found" with the exact permission.
+            impact: >-
+              Callers get 403 Forbidden on every request that needs the
+              unregistered permission, regardless of the roles they hold.
+            runbook_url: "https://github.com/milo-os/openfga-provider/blob/main/docs/runbooks/authz-permission-not-registered.md"
+        - alert: AuthzDecisionReasonMissing
+          expr: |
+            absent_over_time(authz_decisions_total{reason=~".+"}[30m])
+          for: 5m
+          labels:
+            severity: warning
+            service: iam
+            team: platform
+          annotations:
+            summary: >-
+              Authorization decision metrics carry no reason label, so
+              AuthzPermissionNotRegistered cannot fire
+            description: >-
+              No authz_decisions_total series with a reason label has arrived
+              from the OpenFGA authorization webhook in 30 minutes. Either the
+              webhook is no longer being scraped, or the running provider
+              predates the reason label. AuthzPermissionNotRegistered selects
+              on that label and reads as healthy while it is missing.
+            impact: >-
+              An authorization outage caused by an unregistered permission
+              would go unalerted.
+            runbook_url: "https://github.com/milo-os/openfga-provider/blob/main/docs/runbooks/authz-decision-reason-missing.md"
