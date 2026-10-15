@@ -1,7 +1,7 @@
 # AuthzPermissionNotRegistered
 
 **Alert:** `AuthzPermissionNotRegistered`
-**Severity:** Warning
+**Severity:** Critical
 **Fires after:** at least 3 refusals for one API group within 15 minutes, held
 for 5 minutes
 

@@ -16,7 +16,7 @@ spec:
             ) >= 3
           for: 5m
           labels:
-            severity: warning
+            severity: critical
             service: iam
             team: platform
             expected_no_match: "true"
