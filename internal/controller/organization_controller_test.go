@@ -23,7 +23,7 @@ func newOrganizationReconciler(t *testing.T, store *fgaTupleStore, objs ...clien
 		WithScheme(protectedResourceScheme(t)).
 		WithObjects(append(hierarchyResources(), objs...)...).
 		Build()
-	r := &OrganizationReconciler{Client: c, FGAClient: store, FGAStoreID: testStoreID}
+	r := &OrganizationReconciler{Client: c, FGAClient: store, FGAStoreID: testStoreID, Locks: NewObjectLocks(0)}
 	require.NoError(t, r.registerFinalizer())
 	return r
 }

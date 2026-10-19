@@ -7,7 +7,9 @@ import (
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"go.miloapis.com/auth-provider-openfga/internal/openfga"
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 )
 
 // objectTuples finds and deletes the tuples that name one object: the tuples on
@@ -20,14 +22,14 @@ type objectTuples struct {
 	storeID string
 }
 
-// naming returns every tuple that names the object of objectType called name.
-func (o objectTuples) naming(ctx context.Context, objectType, name string) ([]*openfgav1.TupleKey, error) {
-	object := objectType + ":" + name
+// naming returns every tuple that names the object of kind gk called name.
+func (o objectTuples) naming(ctx context.Context, gk schema.GroupKind, name string) ([]*openfgav1.TupleKey, error) {
+	object := openfga.ObjectName(gk.Group, gk.Kind, name)
 	found, err := fetchOpenFGATuples(ctx, o.fga, o.storeID, &openfgav1.ReadRequestTupleKey{Object: object})
 	if err != nil {
 		return nil, err
 	}
-	children, err := o.childTypes(ctx, objectType)
+	children, err := o.childTypes(ctx, gk.Group+"/"+gk.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -71,22 +73,46 @@ func declaresParent(pr iamdatumapiscomv1alpha1.ProtectedResource, parentType str
 	return false
 }
 
-// clear deletes every tuple that names the object, then reads again, and fails
-// while any tuple still names it. It returns how many tuples it deleted.
-func (o objectTuples) clear(ctx context.Context, objectType, name string) (int, error) {
-	found, err := o.naming(ctx, objectType, name)
+// clear deletes every tuple that names the object and returns how many it
+// deleted. It runs without the object's lock, so a slow clear holds up no
+// other writer; remaining, under the lock, finds any tuple written meanwhile.
+func (o objectTuples) clear(ctx context.Context, gk schema.GroupKind, name string) (int, error) {
+	found, err := o.naming(ctx, gk, name)
 	if err != nil {
 		return 0, err
 	}
-	if err := openfga.DeleteTuples(ctx, o.fga, o.storeID, "", found); err != nil {
-		return 0, err
-	}
-	left, err := o.naming(ctx, objectType, name)
+	return len(found), openfga.DeleteTuples(ctx, o.fga, o.storeID, "", found)
+}
+
+// remaining fails while any tuple still names the object.
+func (o objectTuples) remaining(ctx context.Context, gk schema.GroupKind, name string) error {
+	left, err := o.naming(ctx, gk, name)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if len(left) > 0 {
-		return 0, fmt.Errorf("%d tuples still name %s:%s", len(left), objectType, name)
+		return fmt.Errorf("%d tuples still name %s", len(left), openfga.ObjectName(gk.Group, gk.Kind, name))
 	}
-	return len(found), nil
+	return nil
+}
+
+// finalizeWhenClear clears the tuples that name obj without obj's lock, then,
+// under the lock, runs the finalizers, whose read must find none left, and
+// updates obj when they release it. A tuple a binding wrote during the clear
+// fails that read, and the reconcile's retry clears again. The lock covers one
+// read and the release, never the deletes.
+func finalizeWhenClear(ctx context.Context, locks *ObjectLocks, logic *ResourceOwnerHierarchyFinalizerLogic, fins finalizer.Finalizers, obj client.Object) error {
+	object, err := logic.objectName(obj)
+	if err != nil {
+		return err
+	}
+	if err := logic.Clear(ctx, obj); err != nil {
+		return err
+	}
+	defer locks.Lock(object)()
+	res, err := fins.Finalize(ctx, obj)
+	if err != nil || !res.Updated {
+		return err
+	}
+	return logic.Update(ctx, obj)
 }

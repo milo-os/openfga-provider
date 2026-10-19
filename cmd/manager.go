@@ -336,6 +336,9 @@ func runManager(
 		return fmt.Errorf("unable to create controller Role: %w", err)
 	}
 
+	// One lock pool for the three reconcilers that write or clear tuples naming
+	// a Project or an Organization.
+	locks := controller.NewObjectLocks(0)
 	if err = (&controller.PolicyBindingReconciler{
 		EnableSubresourceAuthorization: enableSubresourceAuthorization,
 		Client:                         localMgr.GetClient(),
@@ -345,11 +348,12 @@ func runManager(
 		EventRecorder:                  localMgr.GetEventRecorderFor("policybinding-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
 		ModelIDProvider:                modelIDWatcher,
 		MaxConcurrentReconciles:        policyBindingMaxConcurrentReconciles,
+		Locks:                          locks,
 	}).SetupWithManager(localMgr); err != nil {
 		return fmt.Errorf("unable to create controller PolicyBinding: %w", err)
 	}
 
-	if err = setupHierarchyControllers(localMgr, fgaClient, openfgaStoreID); err != nil {
+	if err = setupHierarchyControllers(localMgr, fgaClient, openfgaStoreID, locks); err != nil {
 		return err
 	}
 
@@ -462,13 +466,14 @@ type localManagerRunnable struct {
 // setupHierarchyControllers registers the controllers that keep the tuples of
 // Projects and Organizations: a Project's parent tuples, and the finalizer that
 // holds a Project or an Organization until no tuple names it.
-func setupHierarchyControllers(mgr ctrl.Manager, fgaClient openfgav1.OpenFGAServiceClient, storeID string) error {
+func setupHierarchyControllers(mgr ctrl.Manager, fgaClient openfgav1.OpenFGAServiceClient, storeID string, locks *controller.ObjectLocks) error {
 	if err := (&controller.ResourceOwnerHierarchyReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		FGAClient:     fgaClient,
 		FGAStoreID:    storeID,
 		EventRecorder: mgr.GetEventRecorderFor("resourceownerhierarchy-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
+		Locks:         locks,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller ResourceOwnerHierarchy: %w", err)
 	}
@@ -476,6 +481,7 @@ func setupHierarchyControllers(mgr ctrl.Manager, fgaClient openfgav1.OpenFGAServ
 		Client:     mgr.GetClient(),
 		FGAClient:  fgaClient,
 		FGAStoreID: storeID,
+		Locks:      locks,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller Organization: %w", err)
 	}

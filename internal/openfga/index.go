@@ -18,10 +18,17 @@ const (
 // TargetObjectFromResourceSelector returns the OpenFGA target object identifier for a selector.
 // For resourceRef targets the object key is always apiGroup/Kind:name, matching buildResourceObject
 // in the auth webhook. resourceRef.namespace is used when fetching the target CR, not in the tuple key.
+// ObjectName is the OpenFGA object that names one object of a Kubernetes kind:
+// <group>/<Kind>:<name>. A binding's target, a parent tuple's user and a deleted
+// object's finalizer all name an object this way, and its lock is keyed by it.
+func ObjectName(group, kind, name string) string {
+	return group + "/" + kind + ":" + name
+}
+
 func TargetObjectFromResourceSelector(selector iamdatumapiscomv1alpha1.ResourceSelector) (string, error) {
 	if selector.ResourceRef != nil {
 		ref := selector.ResourceRef
-		return fmt.Sprintf("%s/%s:%s", ref.APIGroup, ref.Kind, ref.Name), nil
+		return ObjectName(ref.APIGroup, ref.Kind, ref.Name), nil
 	}
 
 	if selector.ResourceKind != nil {
