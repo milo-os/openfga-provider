@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/go-logr/logr"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -18,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
@@ -56,6 +59,7 @@ type ResourceOwnerHierarchyReconciler struct {
 // +kubebuilder:rbac:groups=resourcemanager.miloapis.com,resources=projects,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=resourcemanager.miloapis.com,resources=projects/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=resourcemanager.miloapis.com,resources=projects/finalizers,verbs=update
+// +kubebuilder:rbac:groups=resourcemanager.miloapis.com,resources=organizations,verbs=update
 // Potentially add RBAC for assumed parent types like iam.miloapis.com/organizations if we check their existence (though ownerRef itself doesn't require it)
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -117,6 +121,12 @@ func (r *ResourceOwnerHierarchyReconciler) reconcileProject(ctx context.Context,
 func (r *ResourceOwnerHierarchyReconciler) handleProjectDeletion(ctx context.Context, project *resourcemanagerv1alpha1.Project) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("project", project.Name, "gvk", project.GetObjectKind().GroupVersionKind().String(), "namespace", project.Namespace)
 	logger.Info("Project is being deleted, processing finalizers")
+	if !drained(project) {
+		// Access lasts while Milo drains the Project; Milo's finalizer leaving wakes this controller.
+		logger.Info("Waiting for Milo to drain the Project before removing its tuples")
+		return ctrl.Result{}, nil
+	}
+	defer lockObject(fgaObject(resourcemanagerv1alpha1.GroupVersion.Group, projectKind, project.Name))()
 
 	finalizerResult, err := r.Finalizers.Finalize(ctx, project)
 	if err != nil {
@@ -160,26 +170,94 @@ func (r *ResourceOwnerHierarchyReconciler) synchronizeFGAHierarchy(ctx context.C
 	logger := log.FromContext(ctx).WithValues("resource", resource.GetName(), "gvk", gvk.String(), "namespace", resource.GetNamespace())
 
 	childFGAObjectStr := buildChildFGAIdentifierForResource(resource, gvk, serviceNameForChildResource)
-	desiredParentTuples := r.determineDesiredParentTuplesForResource(resource, validParentGVKsForChild, childFGAObjectStr, RelationName)
-
 	existingFGAParentTupleKeys, err := fetchOpenFGATuples(ctx, r.FGAClient, r.FGAStoreID, &openfgav1.ReadRequestTupleKey{Object: childFGAObjectStr, Relation: RelationName})
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	tuplesToWrite, tuplesToDelete := computeTupleDifferences(desiredParentTuples, existingFGAParentTupleKeys)
-
-	if len(tuplesToDelete) > 0 || len(tuplesToWrite) > 0 {
-		if err := applyOpenFGATupleChanges(ctx, r.FGAClient, r.FGAStoreID, tuplesToWrite, tuplesToDelete); err != nil {
-			logger.Error(err, "Failed to write/delete tuples in OpenFGA")
+	desiredParentTuples := r.determineDesiredParentTuplesForResource(resource, validParentGVKsForChild, childFGAObjectStr, RelationName)
+	_, staleParentTuples := computeTupleDifferences(desiredParentTuples, existingFGAParentTupleKeys)
+	if err := r.applyParentChanges(ctx, logger, nil, staleParentTuples); err != nil {
+		return ctrl.Result{}, err
+	}
+	for _, ref := range resource.GetOwnerReferences() {
+		tuple, ok := desiredParentTuples[parentUser(ref)]
+		if !ok {
+			continue
+		}
+		if err := r.syncParent(ctx, logger, resource.GetNamespace(), ref, tuple, existingFGAParentTupleKeys); err != nil {
 			return ctrl.Result{}, err
 		}
-		logger.Info("Successfully synchronized parent tuples with OpenFGA")
-	} else {
-		logger.V(1).Info("No changes to parent tuples in OpenFGA needed")
 	}
-
 	return ctrl.Result{}, nil
+}
+
+// applyParentChanges writes and deletes parent tuples, and logs what changed.
+func (r *ResourceOwnerHierarchyReconciler) applyParentChanges(ctx context.Context, logger logr.Logger, writes []*openfgav1.TupleKey, deletes []*openfgav1.TupleKeyWithoutCondition) error {
+	if len(deletes) == 0 && len(writes) == 0 {
+		logger.V(1).Info("No changes to parent tuples in OpenFGA needed")
+		return nil
+	}
+	if err := applyOpenFGATupleChanges(ctx, r.FGAClient, r.FGAStoreID, writes, deletes); err != nil {
+		logger.Error(err, "Failed to write/delete tuples in OpenFGA")
+		return err
+	}
+	logger.Info("Successfully synchronized parent tuples with OpenFGA")
+	return nil
+}
+
+// syncParent writes the owner's parent tuple while our finalizer holds the
+// owner, adding the finalizer when it is missing. While the owner is being
+// deleted it leaves the tuple to the owner's finalizer, so access lasts until
+// Milo has drained the owner; it deletes the tuple once the owner is replaced
+// or gone. It runs under the owner's lock, which the owner's finalizer also
+// takes, so the tuple is never written after that finalizer has cleared it.
+func (r *ResourceOwnerHierarchyReconciler) syncParent(ctx context.Context, logger logr.Logger, namespace string, ref metav1.OwnerReference, tuple *openfgav1.TupleKey, existing []*openfgav1.TupleKey) error {
+	defer lockObject(tuple.GetUser())()
+	h, err := r.ownerHold(ctx, namespace, ref)
+	if err != nil {
+		return err
+	}
+	if h == holdDeleting {
+		return nil
+	}
+	desired := map[string]*openfgav1.TupleKey{}
+	if h == holdHeld {
+		desired[tuple.GetUser()] = tuple
+	}
+	writes, deletes := computeTupleDifferences(desired, tuplesOfUser(existing, tuple.GetUser()))
+	return r.applyParentChanges(ctx, logger, writes, deletes)
+}
+
+// ownerHold reads, live, the owner an owner reference names, and holds it with
+// our finalizer when it lacks it.
+func (r *ResourceOwnerHierarchyReconciler) ownerHold(ctx context.Context, namespace string, ref metav1.OwnerReference) (hold, error) {
+	owner := &unstructured.Unstructured{}
+	owner.SetGroupVersionKind(schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind))
+	err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, owner)
+	if errors.IsNotFound(err) {
+		return holdMissing, nil
+	}
+	if err != nil {
+		return holdMissing, err
+	}
+	return holdTarget(ctx, r.Client, owner, ref.UID)
+}
+
+func tuplesOfUser(tuples []*openfgav1.TupleKey, user string) []*openfgav1.TupleKey {
+	var found []*openfgav1.TupleKey
+	for _, t := range tuples {
+		if t.GetUser() == user {
+			found = append(found, t)
+		}
+	}
+	return found
+}
+
+// parentUser is the OpenFGA user that names a resource's owner as its parent.
+func parentUser(ref metav1.OwnerReference) string {
+	gvk := schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind)
+	return fmt.Sprintf("%s/%s:%s", gvk.Group, gvk.Kind, ref.Name)
 }
 
 // --- OpenFGA Interaction Helpers ---
@@ -227,10 +305,7 @@ func (r *ResourceOwnerHierarchyReconciler) determineDesiredParentTuplesForResour
 
 		if allowed {
 			logger.V(1).Info("OwnerReference matched a valid parent GVK", "ownerGVK", ownerGVK.String())
-			parentServiceName := ownerGVK.Group
-			parentFGAType := fmt.Sprintf("%s/%s", parentServiceName, ownerGVK.Kind)
-
-			userStr := fmt.Sprintf("%s:%s", parentFGAType, ownerRef.Name)
+			userStr := parentUser(ownerRef)
 			tuple := &openfgav1.TupleKey{
 				User:     userStr,
 				Relation: relationName,
@@ -341,78 +416,29 @@ func applyOpenFGATupleChanges(ctx context.Context, fgaClient openfgav1.OpenFGASe
 
 // --- OpenFGA Finalization Logic ---
 
+// ResourceOwnerHierarchyFinalizerLogic removes every tuple that names the
+// object being deleted, as the object and as the user. It holds Projects and
+// Organizations in storage, so their names stay taken until no tuple names
+// them.
 type ResourceOwnerHierarchyFinalizerLogic struct {
 	client.Client
 	FGAClient  openfgav1.OpenFGAServiceClient
 	FGAStoreID string
 }
 
+// Finalize fails while any tuple still names the object, so the finalizer stays.
 func (f *ResourceOwnerHierarchyFinalizerLogic) Finalize(ctx context.Context, obj client.Object) (finalizer.Result, error) {
-	logger := log.FromContext(ctx).WithValues("finalizer", "ResourceOwnerHierarchyFinalizerLogic")
-
-	gvk := obj.GetObjectKind().GroupVersionKind()
-	if gvk.Kind == "" || gvk.Group == "" {
-		u, isUnstructured := obj.(*metav1.PartialObjectMetadata) // Check if it's at least PartialObjectMetadata
-		if isUnstructured && u != nil {
-			gvk = u.GroupVersionKind()
-		} else {
-			gvks, _, schemeErr := f.Client.Scheme().ObjectKinds(obj)
-			if schemeErr == nil && len(gvks) > 0 {
-				gvk = gvks[0]
-			} else {
-				logger.Error(schemeErr, "Finalizer: Could not determine GVK for object being finalized", "objectName", obj.GetName(), "objectNamespace", obj.GetNamespace())
-				if gvk.Group == "" {
-					finalizerErr := fmt.Errorf("finalizer: GVK group is empty for object %s/%s, cannot determine FGA service name for type %T", obj.GetNamespace(), obj.GetName(), obj)
-					logger.Error(finalizerErr, "Critical GVK info missing for finalization")
-					return finalizer.Result{}, finalizerErr
-				}
-			}
-		}
-	}
-
-	serviceNameForResource := gvk.Group
-
-	logger = logger.WithValues("cleanup", obj.GetName(), "gvk", gvk.String())
-	logger.Info("Cleaning up OpenFGA relationships for deleted resource via finalizer")
-
-	childFGAObjectStr := buildChildFGAIdentifierForResource(obj, gvk, serviceNameForResource)
-
-	existingParentTuples, err := fetchOpenFGATuples(ctx, f.FGAClient, f.FGAStoreID, &openfgav1.ReadRequestTupleKey{Object: childFGAObjectStr, Relation: RelationName})
+	gvk, err := apiutil.GVKForObject(obj, f.Scheme())
 	if err != nil {
-		s, statusOk := status.FromError(err)
-		if statusOk && s.Code() == codes.NotFound {
-			logger.Info("No parent tuples found in FGA for cleanup. Finalizing.")
-			controllerutil.RemoveFinalizer(obj, resourceOwnerHierarchyFinalizer)
-			return finalizer.Result{Updated: true}, nil
-		}
-		logger.Error(err, "Failed to read parent tuples from OpenFGA for cleanup during finalization")
+		return finalizer.Result{}, fmt.Errorf("finalizer: cannot determine the kind of %s: %w", obj.GetName(), err)
+	}
+	object := objectTuples{reader: f.Client, fga: f.FGAClient, storeID: f.FGAStoreID}
+	removed, err := object.clear(ctx, gvk.Group+"/"+gvk.Kind, obj.GetName())
+	if err != nil {
 		return finalizer.Result{}, err
 	}
-
-	tuplesToDelete := make([]*openfgav1.TupleKeyWithoutCondition, 0, len(existingParentTuples))
-	for _, tk := range existingParentTuples {
-		tuplesToDelete = append(tuplesToDelete, &openfgav1.TupleKeyWithoutCondition{
-			User:     tk.User,
-			Relation: tk.Relation,
-			Object:   tk.Object,
-		})
-	}
-
-	if len(tuplesToDelete) > 0 {
-		logger.Info("Deleting parent relationship tuples from OpenFGA via finalizer", "count", len(tuplesToDelete))
-		if err := applyOpenFGATupleChanges(ctx, f.FGAClient, f.FGAStoreID, nil, tuplesToDelete); err != nil {
-			logger.Error(err, "Failed to delete tuples from OpenFGA during finalizer cleanup")
-			return finalizer.Result{}, err
-		}
-		logger.Info("Successfully deleted parent tuples from OpenFGA during finalizer cleanup")
-	} else {
-		logger.Info("No parent tuples to delete from FGA during finalizer cleanup.")
-	}
-
-	logger.Info("Further cleanup of relationships where this resource was a parent might be needed (model dependent). This finalizer only cleans direct parent links.")
-
-	controllerutil.RemoveFinalizer(obj, resourceOwnerHierarchyFinalizer)
-	return finalizer.Result{Updated: true}, nil
+	log.FromContext(ctx).Info("Removed every OpenFGA tuple naming the object", "kind", gvk.Kind, "name", obj.GetName(), "count", removed)
+	return finalizer.Result{}, nil
 }
 
 // --- Controller Setup & Utilities ---
@@ -424,14 +450,7 @@ func (r *ResourceOwnerHierarchyReconciler) SetupWithManager(mgr ctrl.Manager) er
 		log.Log.Info("FGAStoreID not explicitly set, using default.", "storeID", r.FGAStoreID)
 	}
 
-	// Initialize hardcoded valid parent GVKs for Projects.
-	// Project is owned by an Organization from the resourcemanager API group.
-	r.validProjectParentGVKs = make(map[schema.GroupVersionKind]struct{})
-	r.validProjectParentGVKs[schema.GroupVersionKind{
-		Group:   resourcemanagerv1alpha1.GroupVersion.Group,
-		Version: resourcemanagerv1alpha1.GroupVersion.Version,
-		Kind:    "Organization",
-	}] = struct{}{}
+	r.validProjectParentGVKs = projectParentGVKs()
 
 	r.Finalizers = finalizer.NewFinalizers()
 	if err := r.Finalizers.Register(resourceOwnerHierarchyFinalizer, &ResourceOwnerHierarchyFinalizerLogic{
@@ -497,6 +516,14 @@ func (r *ResourceOwnerHierarchyReconciler) SetupWithManager(mgr ctrl.Manager) er
 		Named("resourceownerhierarchy-controller").
 		For(&resourcemanagerv1alpha1.Project{}, builder.WithPredicates(projectPredicate)).
 		Complete(r)
+}
+
+// projectParentGVKs returns the kinds whose owner reference gives a Project its
+// parent tuple: an Organization.
+func projectParentGVKs() map[schema.GroupVersionKind]struct{} {
+	return map[schema.GroupVersionKind]struct{}{
+		resourcemanagerv1alpha1.GroupVersion.WithKind(organizationKind): {},
+	}
 }
 
 func equalFinalizers(a, b []string) bool {

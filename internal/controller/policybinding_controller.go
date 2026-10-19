@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -54,6 +55,8 @@ const (
 	// ReasonValidationFailed indicates that a validation check has failed, detailing why the resource or reference is not
 	// considered valid.
 	ReasonValidationFailed = "ValidationFailed"
+	// reasonWaitingForTarget is Ready's reason when a write waits for its target.
+	reasonWaitingForTarget = "WaitingForTarget"
 
 	// protectedResourceServiceKindIndexField indexes ProtectedResources by
 	// "<serviceRef.name>/<kind>"
@@ -81,6 +84,7 @@ func (e *MissingNamespaceError) Error() string {
 // +kubebuilder:rbac:groups=iam.miloapis.com,resources=protectedresources,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=users;groups,verbs=get;list;watch
 // +kubebuilder:rbac:groups="*",resources="*",verbs=get;list;watch
+// +kubebuilder:rbac:groups=resourcemanager.miloapis.com,resources=projects;organizations,verbs=update
 
 // PolicyBindingReconciler reconciles a PolicyBinding object. It ensures that the state of OpenFGA policies reflects the
 // desired state specified in PolicyBinding custom resources. This involves validating references to Kubernetes
@@ -220,22 +224,7 @@ func (r *PolicyBindingReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrlResult, fmt.Errorf("failed to reconcile OpenFGA policy: %w", err)
 	}
-
-	// All steps were successful: finalizer ensured, target validated, subjects validated, OpenFGA reconciled.
-	log.Info("Successfully reconciled PolicyBinding")
-	meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "ReconciliationSuccessful",
-		Message:            "PolicyBinding reconciled successfully.",
-		LastTransitionTime: metav1.Now(),
-	})
-	// Use the new status update helper
-	if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after successful reconciliation: %w", err)
-	}
-
-	return ctrl.Result{}, nil
+	return ctrlResult, nil
 }
 
 // reconcileResourceSelectorValidation performs validation based on whether ResourceRef or ResourceKind is specified.
@@ -462,9 +451,15 @@ func (r *PolicyBindingReconciler) reconcileOpenFGAPolicy(ctx context.Context, po
 		Client:                         r.FgaClient,
 		K8sClient:                      r.Client,
 		ModelIDProvider:                r.ModelIDProvider,
+		TargetGuard:                    r.targetGuard(policyBinding),
 	}
 
-	if err := policyReconciler.ReconcilePolicy(ctx, *policyBinding); err != nil {
+	if err := reconcilePolicyLocked(ctx, &policyReconciler, policyBinding); err != nil {
+		var notHeld *openfga.TargetNotHeldError
+		if errors.As(err, &notHeld) {
+			log.Info("Deferred the binding's write", "reason", err.Error())
+			return r.deferWrite(ctx, policyBinding, oldStatus, currentGeneration, notHeld.Reason)
+		}
 		log.Error(err, "Failed to reconcile authorization binding")
 
 		// Default reason for failure.
@@ -511,8 +506,72 @@ func (r *PolicyBindingReconciler) reconcileOpenFGAPolicy(ctx context.Context, po
 		LastTransitionTime: metav1.Now(),
 	})
 
-	// OpenFGA reconciliation successful.
+	// All steps were successful: finalizer ensured, target validated, subjects validated, OpenFGA reconciled.
+	log.Info("Successfully reconciled PolicyBinding")
+	meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             "ReconciliationSuccessful",
+		Message:            "PolicyBinding reconciled successfully.",
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after successful reconciliation: %w", err)
+	}
 	return ctrl.Result{}, nil
+}
+
+// targetGuard returns the check run before a write that adds tuples, for a
+// binding whose target our finalizer holds: one live read of the target, and
+// our finalizer added when it is missing, so a write lands only on a target the
+// finalizer will clear. Other targets get none.
+func (r *PolicyBindingReconciler) targetGuard(policyBinding *iamdatumapiscomv1alpha1.PolicyBinding) openfga.TargetGuard {
+	ref := policyBinding.Spec.ResourceSelector.ResourceRef
+	if ref == nil || !isHeldKind(ref.APIGroup, ref.Kind) {
+		return nil
+	}
+	return func(ctx context.Context) (string, error) {
+		target, err := r.getUnstructuredResourceAndMapping(ctx, ref.APIGroup, ref.Kind, ref.Name, ref.Namespace)
+		if apierrors.IsNotFound(err) {
+			return holdMissing.whyNotHeld(ref.Kind, ref.Name), nil
+		}
+		if err != nil {
+			return "", err
+		}
+		h, err := holdTarget(ctx, r.Client, target, types.UID(ref.UID))
+		return h.whyNotHeld(ref.Kind, ref.Name), err
+	}
+}
+
+// reconcilePolicyLocked reconciles the binding's tuples under its target's lock
+// when the target is guarded, so the target's finalizer cannot clear and
+// release it between the check and the write.
+func reconcilePolicyLocked(ctx context.Context, policyReconciler *openfga.PolicyReconciler, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding) error {
+	if policyReconciler.TargetGuard != nil {
+		object, err := openfga.TargetObjectFromResourceSelector(policyBinding.Spec.ResourceSelector)
+		if err != nil {
+			return err
+		}
+		defer lockObject(object)()
+	}
+	return policyReconciler.ReconcilePolicy(ctx, *policyBinding)
+}
+
+// deferWrite says, in plain words, why no permissions were written, and
+// retries: the target may take them later, or it goes and validation then
+// reports that.
+func (r *PolicyBindingReconciler) deferWrite(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, oldStatus *iamdatumapiscomv1alpha1.PolicyBindingStatus, currentGeneration int64, reason string) (ctrl.Result, error) {
+	meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonWaitingForTarget,
+		Message:            fmt.Sprintf("No permissions were written, because %s. Retrying.", reason),
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update PolicyBinding status after deferring its write: %w", err)
+	}
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // updatePolicyBindingStatus is a helper function to consistently update the PolicyBinding's status subresource. It sets

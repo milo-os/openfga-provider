@@ -349,14 +349,8 @@ func runManager(
 		return fmt.Errorf("unable to create controller PolicyBinding: %w", err)
 	}
 
-	if err = (&controller.ResourceOwnerHierarchyReconciler{
-		Client:        localMgr.GetClient(),
-		Scheme:        localMgr.GetScheme(),
-		FGAClient:     fgaClient,
-		FGAStoreID:    openfgaStoreID,
-		EventRecorder: localMgr.GetEventRecorderFor("resourceownerhierarchy-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
-	}).SetupWithManager(localMgr); err != nil {
-		return fmt.Errorf("unable to create controller ResourceOwnerHierarchy: %w", err)
+	if err = setupHierarchyControllers(localMgr, fgaClient, openfgaStoreID); err != nil {
+		return err
 	}
 
 	// Create an in-cluster client for ConfigMap operations. The manager's
@@ -463,6 +457,29 @@ type runnableProvider interface {
 type localManagerRunnable struct {
 	mcMgr    mcmanager.Manager
 	localMgr manager.Manager
+}
+
+// setupHierarchyControllers registers the controllers that keep the tuples of
+// Projects and Organizations: a Project's parent tuples, and the finalizer that
+// holds a Project or an Organization until no tuple names it.
+func setupHierarchyControllers(mgr ctrl.Manager, fgaClient openfgav1.OpenFGAServiceClient, storeID string) error {
+	if err := (&controller.ResourceOwnerHierarchyReconciler{
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		FGAClient:     fgaClient,
+		FGAStoreID:    storeID,
+		EventRecorder: mgr.GetEventRecorderFor("resourceownerhierarchy-controller"), //nolint:staticcheck // Controllers still use the legacy record.EventRecorder interface.
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller ResourceOwnerHierarchy: %w", err)
+	}
+	if err := (&controller.OrganizationReconciler{
+		Client:     mgr.GetClient(),
+		FGAClient:  fgaClient,
+		FGAStoreID: storeID,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller Organization: %w", err)
+	}
+	return nil
 }
 
 func (r *localManagerRunnable) Start(ctx context.Context) error {
