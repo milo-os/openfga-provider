@@ -48,6 +48,8 @@ type ResourceOwnerHierarchyReconciler struct {
 	Mgr                  ctrl.Manager
 	AuthzModelReconciler *openfga.AuthorizationModelReconciler
 	Finalizers           finalizer.Finalizers
+	// Locks is the pool the binding and Organization controllers share.
+	Locks *ObjectLocks
 
 	// mu protects access to ... (if any shared state remains, not for watchedGVKs anymore)
 	mu sync.RWMutex
@@ -126,20 +128,9 @@ func (r *ResourceOwnerHierarchyReconciler) handleProjectDeletion(ctx context.Con
 		logger.Info("Waiting for Milo to drain the Project before removing its tuples")
 		return ctrl.Result{}, nil
 	}
-	defer lockObject(fgaObject(resourcemanagerv1alpha1.GroupVersion.Group, projectKind, project.Name))()
-
-	finalizerResult, err := r.Finalizers.Finalize(ctx, project)
-	if err != nil {
+	if err := finalizeWhenClear(ctx, r.Locks, r.finalizerLogic(), r.Finalizers, project); err != nil {
 		logger.Error(err, "Failed to finalize Project")
 		return ctrl.Result{}, err
-	}
-
-	if finalizerResult.Updated {
-		logger.Info("Project updated by finalizer, updating object")
-		if err := r.Update(ctx, project); err != nil {
-			logger.Error(err, "Failed to update Project after finalizer operation")
-			return ctrl.Result{}, err
-		}
 	}
 
 	if controllerutil.ContainsFinalizer(project, resourceOwnerHierarchyFinalizer) {
@@ -213,7 +204,7 @@ func (r *ResourceOwnerHierarchyReconciler) applyParentChanges(ctx context.Contex
 // or gone. It runs under the owner's lock, which the owner's finalizer also
 // takes, so the tuple is never written after that finalizer has cleared it.
 func (r *ResourceOwnerHierarchyReconciler) syncParent(ctx context.Context, logger logr.Logger, namespace string, ref metav1.OwnerReference, tuple *openfgav1.TupleKey, existing []*openfgav1.TupleKey) error {
-	defer lockObject(tuple.GetUser())()
+	defer r.Locks.Lock(tuple.GetUser())()
 	h, err := r.ownerHold(ctx, namespace, ref)
 	if err != nil {
 		return err
@@ -257,7 +248,7 @@ func tuplesOfUser(tuples []*openfgav1.TupleKey, user string) []*openfgav1.TupleK
 // parentUser is the OpenFGA user that names a resource's owner as its parent.
 func parentUser(ref metav1.OwnerReference) string {
 	gvk := schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind)
-	return fmt.Sprintf("%s/%s:%s", gvk.Group, gvk.Kind, ref.Name)
+	return openfga.ObjectName(gvk.Group, gvk.Kind, ref.Name)
 }
 
 // --- OpenFGA Interaction Helpers ---
@@ -426,24 +417,66 @@ type ResourceOwnerHierarchyFinalizerLogic struct {
 	FGAStoreID string
 }
 
-// Finalize fails while any tuple still names the object, so the finalizer stays.
-func (f *ResourceOwnerHierarchyFinalizerLogic) Finalize(ctx context.Context, obj client.Object) (finalizer.Result, error) {
-	gvk, err := apiutil.GVKForObject(obj, f.Scheme())
+// Clear deletes every tuple that names obj, as the object and as the user. It
+// runs before obj's lock is taken; Finalize then checks under the lock.
+func (f *ResourceOwnerHierarchyFinalizerLogic) Clear(ctx context.Context, obj client.Object) error {
+	gk, err := f.groupKind(obj)
 	if err != nil {
-		return finalizer.Result{}, fmt.Errorf("finalizer: cannot determine the kind of %s: %w", obj.GetName(), err)
+		return err
 	}
-	object := objectTuples{reader: f.Client, fga: f.FGAClient, storeID: f.FGAStoreID}
-	removed, err := object.clear(ctx, gvk.Group+"/"+gvk.Kind, obj.GetName())
+	removed, err := f.tuples().clear(ctx, gk, obj.GetName())
+	if err != nil {
+		return err
+	}
+	if removed > 0 {
+		log.FromContext(ctx).Info("Removed every OpenFGA tuple naming the object", "object", openfga.ObjectName(gk.Group, gk.Kind, obj.GetName()), "count", removed)
+	}
+	return nil
+}
+
+// Finalize fails while any tuple still names the object, so the finalizer
+// stays. It runs under the object's lock, after Clear, so a tuple a binding
+// wrote during the clear is found here and cleared on the retry.
+func (f *ResourceOwnerHierarchyFinalizerLogic) Finalize(ctx context.Context, obj client.Object) (finalizer.Result, error) {
+	gk, err := f.groupKind(obj)
 	if err != nil {
 		return finalizer.Result{}, err
 	}
-	log.FromContext(ctx).Info("Removed every OpenFGA tuple naming the object", "kind", gvk.Kind, "name", obj.GetName(), "count", removed)
-	return finalizer.Result{}, nil
+	return finalizer.Result{}, f.tuples().remaining(ctx, gk, obj.GetName())
+}
+
+// objectName is the OpenFGA object that names obj, which also keys its lock.
+func (f *ResourceOwnerHierarchyFinalizerLogic) objectName(obj client.Object) (string, error) {
+	gk, err := f.groupKind(obj)
+	if err != nil {
+		return "", err
+	}
+	return openfga.ObjectName(gk.Group, gk.Kind, obj.GetName()), nil
+}
+
+func (f *ResourceOwnerHierarchyFinalizerLogic) groupKind(obj client.Object) (schema.GroupKind, error) {
+	gvk, err := apiutil.GVKForObject(obj, f.Scheme())
+	if err != nil {
+		return schema.GroupKind{}, fmt.Errorf("finalizer: cannot determine the kind of %s: %w", obj.GetName(), err)
+	}
+	return gvk.GroupKind(), nil
+}
+
+func (f *ResourceOwnerHierarchyFinalizerLogic) tuples() objectTuples {
+	return objectTuples{reader: f.Client, fga: f.FGAClient, storeID: f.FGAStoreID}
 }
 
 // --- Controller Setup & Utilities ---
 
+// finalizerLogic is the finalizer this controller registers, and clears with.
+func (r *ResourceOwnerHierarchyReconciler) finalizerLogic() *ResourceOwnerHierarchyFinalizerLogic {
+	return &ResourceOwnerHierarchyFinalizerLogic{Client: r.Client, FGAClient: r.FGAClient, FGAStoreID: r.FGAStoreID}
+}
+
 func (r *ResourceOwnerHierarchyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Locks == nil {
+		return errNoLocks
+	}
 	r.Mgr = mgr
 	if r.FGAStoreID == "" {
 		r.FGAStoreID = DefaultOpenFGAStoreID
@@ -453,11 +486,7 @@ func (r *ResourceOwnerHierarchyReconciler) SetupWithManager(mgr ctrl.Manager) er
 	r.validProjectParentGVKs = projectParentGVKs()
 
 	r.Finalizers = finalizer.NewFinalizers()
-	if err := r.Finalizers.Register(resourceOwnerHierarchyFinalizer, &ResourceOwnerHierarchyFinalizerLogic{
-		Client:     r.Client,
-		FGAClient:  r.FGAClient,
-		FGAStoreID: r.FGAStoreID,
-	}); err != nil {
+	if err := r.Finalizers.Register(resourceOwnerHierarchyFinalizer, r.finalizerLogic()); err != nil {
 		return fmt.Errorf("failed to register finalizer: %w", err)
 	}
 
@@ -471,51 +500,63 @@ func (r *ResourceOwnerHierarchyReconciler) SetupWithManager(mgr ctrl.Manager) er
 		r.AuthzModelReconciler.StoreID = r.FGAStoreID
 	}
 
-	projectPredicate := predicate.Funcs{
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("resourceownerhierarchy-controller").
+		For(&resourcemanagerv1alpha1.Project{}, builder.WithPredicates(projectPredicate())).
+		Complete(r)
+}
+
+// projectPredicate admits the Project events the hierarchy reacts to: every
+// create, a change of spec, owners, finalizers or deletion, and a delete our
+// finalizer still holds.
+func projectPredicate() predicate.Funcs {
+	return predicate.Funcs{
 		CreateFunc: func(_ event.CreateEvent) bool {
 			// Always reconcile Project creates for now, ownerRef check is done in reconcileProject
 			log.Log.V(2).Info("Predicate: Allowing CreateEvent for Project")
 			return true
 		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			objOld := e.ObjectOld
-			objNew := e.ObjectNew
-			if objOld == nil || objNew == nil {
-				log.Log.Error(nil, "Predicate: UpdateEvent with nil objects")
-				return false
-			}
-			if objNew.GetGeneration() != objOld.GetGeneration() ||
-				!equalOwnerReferences(objNew.GetOwnerReferences(), objOld.GetOwnerReferences()) ||
-				!equalFinalizers(objNew.GetFinalizers(), objOld.GetFinalizers()) ||
-				(objNew.GetDeletionTimestamp() != nil && objOld.GetDeletionTimestamp() == nil) ||
-				(objNew.GetDeletionTimestamp() == nil && objOld.GetDeletionTimestamp() != nil) {
-				log.Log.V(2).Info("Predicate: Allowing UpdateEvent for Project due to spec/metadata/deletion change")
-				return true
-			}
-			return false
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			obj := e.Object
-			if obj == nil {
-				log.Log.Error(nil, "Predicate: DeleteEvent with nil object")
-				return false
-			}
-			if controllerutil.ContainsFinalizer(obj, resourceOwnerHierarchyFinalizer) || e.DeleteStateUnknown {
-				log.Log.V(2).Info("Predicate: Allowing DeleteEvent for Project", "finalizerPresent", controllerutil.ContainsFinalizer(obj, resourceOwnerHierarchyFinalizer), "deleteStateUnknown", e.DeleteStateUnknown)
-				return true
-			}
-			return false // Only reconcile deletes if our finalizer is present or state is unknown
-		},
+		UpdateFunc: projectUpdateMatters,
+		DeleteFunc: projectDeleteMatters,
 		GenericFunc: func(_ event.GenericEvent) bool {
 			log.Log.V(2).Info("Predicate: Allowing GenericEvent for Project")
 			return true // Reconcile all generic events for now
 		},
 	}
+}
 
-	return ctrl.NewControllerManagedBy(mgr).
-		Named("resourceownerhierarchy-controller").
-		For(&resourcemanagerv1alpha1.Project{}, builder.WithPredicates(projectPredicate)).
-		Complete(r)
+// projectUpdateMatters admits a change of spec, owners, finalizers or deletion.
+func projectUpdateMatters(e event.UpdateEvent) bool {
+	objOld := e.ObjectOld
+	objNew := e.ObjectNew
+	if objOld == nil || objNew == nil {
+		log.Log.Error(nil, "Predicate: UpdateEvent with nil objects")
+		return false
+	}
+	if objNew.GetGeneration() != objOld.GetGeneration() ||
+		!equalOwnerReferences(objNew.GetOwnerReferences(), objOld.GetOwnerReferences()) ||
+		!equalFinalizers(objNew.GetFinalizers(), objOld.GetFinalizers()) ||
+		(objNew.GetDeletionTimestamp() != nil && objOld.GetDeletionTimestamp() == nil) ||
+		(objNew.GetDeletionTimestamp() == nil && objOld.GetDeletionTimestamp() != nil) {
+		log.Log.V(2).Info("Predicate: Allowing UpdateEvent for Project due to spec/metadata/deletion change")
+		return true
+	}
+	return false
+}
+
+// projectDeleteMatters admits a delete our finalizer still holds, or one of
+// unknown state.
+func projectDeleteMatters(e event.DeleteEvent) bool {
+	obj := e.Object
+	if obj == nil {
+		log.Log.Error(nil, "Predicate: DeleteEvent with nil object")
+		return false
+	}
+	if controllerutil.ContainsFinalizer(obj, resourceOwnerHierarchyFinalizer) || e.DeleteStateUnknown {
+		log.Log.V(2).Info("Predicate: Allowing DeleteEvent for Project", "finalizerPresent", controllerutil.ContainsFinalizer(obj, resourceOwnerHierarchyFinalizer), "deleteStateUnknown", e.DeleteStateUnknown)
+		return true
+	}
+	return false // Only reconcile deletes if our finalizer is present or state is unknown
 }
 
 // projectParentGVKs returns the kinds whose owner reference gives a Project its

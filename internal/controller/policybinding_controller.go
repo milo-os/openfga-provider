@@ -105,6 +105,9 @@ type PolicyBindingReconciler struct {
 	// MaxConcurrentReconciles controls PolicyBinding reconcile parallelism.
 	// When zero, defaultPolicyBindingMaxConcurrentReconciles is used.
 	MaxConcurrentReconciles int
+	// Locks is the pool the Project and Organization controllers share: a
+	// binding's write onto a Project or an Organization takes its target's lock.
+	Locks *ObjectLocks
 }
 
 // Reconcile is the core reconciliation loop for PolicyBinding resources. It is called by the controller-runtime when a
@@ -454,7 +457,7 @@ func (r *PolicyBindingReconciler) reconcileOpenFGAPolicy(ctx context.Context, po
 		TargetGuard:                    r.targetGuard(policyBinding),
 	}
 
-	if err := reconcilePolicyLocked(ctx, &policyReconciler, policyBinding); err != nil {
+	if err := r.reconcilePolicyLocked(ctx, &policyReconciler, policyBinding); err != nil {
 		var notHeld *openfga.TargetNotHeldError
 		if errors.As(err, &notHeld) {
 			log.Info("Deferred the binding's write", "reason", err.Error())
@@ -544,15 +547,15 @@ func (r *PolicyBindingReconciler) targetGuard(policyBinding *iamdatumapiscomv1al
 }
 
 // reconcilePolicyLocked reconciles the binding's tuples under its target's lock
-// when the target is guarded, so the target's finalizer cannot clear and
+// when the target is guarded, so the target's finalizer cannot read and
 // release it between the check and the write.
-func reconcilePolicyLocked(ctx context.Context, policyReconciler *openfga.PolicyReconciler, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding) error {
+func (r *PolicyBindingReconciler) reconcilePolicyLocked(ctx context.Context, policyReconciler *openfga.PolicyReconciler, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding) error {
 	if policyReconciler.TargetGuard != nil {
 		object, err := openfga.TargetObjectFromResourceSelector(policyBinding.Spec.ResourceSelector)
 		if err != nil {
 			return err
 		}
-		defer lockObject(object)()
+		defer r.Locks.Lock(object)()
 	}
 	return policyReconciler.ReconcilePolicy(ctx, *policyBinding)
 }
@@ -930,6 +933,9 @@ func (r *PolicyBindingReconciler) enqueuePolicyBindingsForRoleChange(ctx context
 // SetupWithManager sets up the controller with the Manager. It configures watches for PolicyBinding resources and, if
 // the RESTMapper is available, for changes to Service resources, which can affect PolicyBinding validation.
 func (r *PolicyBindingReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Locks == nil {
+		return errNoLocks
+	}
 	if r.RESTMapper == nil {
 		r.RESTMapper = mgr.GetRESTMapper()
 	}

@@ -60,14 +60,15 @@ func newGateWorld(t *testing.T, kind string, target client.Object, funcs interce
 		WithInterceptorFuncs(funcs).
 		Build()
 	store := &fgaTupleStore{}
+	locks := NewObjectLocks(0)
 	r := &PolicyBindingReconciler{Client: c, Scheme: s, RESTMapper: gateMapper(), FgaClient: store, StoreID: testStoreID,
-		Finalizers: finalizer.NewFinalizers()}
+		Finalizers: finalizer.NewFinalizers(), Locks: locks}
 	require.NoError(t, r.Finalizers.Register(policyBindingFinalizerKey, &openFGAFinalizer{Client: c, fgaClient: store, storeID: testStoreID,
 		policyReconciler: &openfga.PolicyReconciler{StoreID: testStoreID, Client: store, K8sClient: c}}))
 	h := &ResourceOwnerHierarchyReconciler{Client: c, FGAClient: store, FGAStoreID: testStoreID, validProjectParentGVKs: projectParentGVKs(),
-		Finalizers: finalizer.NewFinalizers()}
+		Finalizers: finalizer.NewFinalizers(), Locks: locks}
 	require.NoError(t, h.Finalizers.Register(resourceOwnerHierarchyFinalizer, &ResourceOwnerHierarchyFinalizerLogic{Client: c, FGAClient: store, FGAStoreID: testStoreID}))
-	return &gateWorld{binding: r, hierarchy: h, client: c, store: store, object: fgaObject(resourceManagerGroup, kind, target.GetName())}
+	return &gateWorld{binding: r, hierarchy: h, client: c, store: store, object: openfga.ObjectName(resourceManagerGroup, kind, target.GetName())}
 }
 
 func bindingTargetObject(rawObj client.Object) []string {

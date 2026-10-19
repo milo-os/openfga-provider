@@ -46,10 +46,12 @@ type fgaTupleStore struct {
 	tuples []*openfgav1.TupleKey
 	// added counts the writes that added tuples.
 	added int
-	// beforeWrite runs before a write that adds tuples is applied, and
-	// afterWrite after each successful write; both stand in for other actors.
-	beforeWrite func(*fgaTupleStore)
-	afterWrite  func(*fgaTupleStore)
+	// beforeWrite runs before a write that adds tuples is applied,
+	// beforeDelete before one that deletes tuples, and afterWrite after each
+	// successful write; they stand in for other actors and for a slow store.
+	beforeWrite  func(*fgaTupleStore)
+	beforeDelete func(*fgaTupleStore)
+	afterWrite   func(*fgaTupleStore)
 }
 
 func (s *fgaTupleStore) Read(_ context.Context, in *openfgav1.ReadRequest, _ ...grpc.CallOption) (*openfgav1.ReadResponse, error) {
@@ -94,6 +96,9 @@ func (s *fgaTupleStore) Write(_ context.Context, in *openfgav1.WriteRequest, _ .
 	writes := in.GetWrites().GetTupleKeys()
 	if len(writes) > 0 && s.beforeWrite != nil {
 		s.beforeWrite(s)
+	}
+	if len(in.GetDeletes().GetTupleKeys()) > 0 && s.beforeDelete != nil {
+		s.beforeDelete(s)
 	}
 	if err := s.apply(in.GetDeletes(), writes); err != nil {
 		return nil, err
@@ -221,6 +226,16 @@ func newFinalizerLogic(t *testing.T, store *fgaTupleStore) *ResourceOwnerHierarc
 	return &ResourceOwnerHierarchyFinalizerLogic{Client: c, FGAClient: store, FGAStoreID: testStoreID}
 }
 
+// clearThenFinalize runs what finalizeWhenClear runs, without the lock and the
+// release: the clear, then the finalizer's read.
+func clearThenFinalize(logic *ResourceOwnerHierarchyFinalizerLogic, obj client.Object) error {
+	if err := logic.Clear(context.Background(), obj); err != nil {
+		return err
+	}
+	_, err := logic.Finalize(context.Background(), obj)
+	return err
+}
+
 func grant(user, object string) *openfgav1.TupleKey {
 	return &openfgav1.TupleKey{User: "iam.miloapis.com/InternalUser:" + user, Relation: grantRelation, Object: object}
 }
@@ -241,7 +256,7 @@ func TestProjectFinalizerRemovesEveryTupleNamingTheProject(t *testing.T) {
 	}}
 	project := &resourcemanagerv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p1"}}
 
-	_, err := newFinalizerLogic(t, store).Finalize(context.Background(), project)
+	err := clearThenFinalize(newFinalizerLogic(t, store), project)
 
 	require.NoError(t, err)
 	require.Empty(t, store.naming(deleted), "a tuple naming the deleted Project survived its finalizer")
@@ -260,7 +275,7 @@ func TestOrganizationFinalizerRemovesEveryTupleNamingTheOrganization(t *testing.
 	}}
 	org := &resourcemanagerv1alpha1.Organization{ObjectMeta: metav1.ObjectMeta{Name: "org-a"}}
 
-	_, err := newFinalizerLogic(t, store).Finalize(context.Background(), org)
+	err := clearThenFinalize(newFinalizerLogic(t, store), org)
 
 	require.NoError(t, err)
 	require.Empty(t, store.naming(deleted), "a tuple naming the deleted Organization, as object or as user, survived")
@@ -276,7 +291,7 @@ func TestFinalizerRemovesTuplesAcrossPagesAndWrites(t *testing.T) {
 	}
 	project := &resourcemanagerv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p1"}}
 
-	_, err := newFinalizerLogic(t, store).Finalize(context.Background(), project)
+	err := clearThenFinalize(newFinalizerLogic(t, store), project)
 
 	require.NoError(t, err)
 	require.Empty(t, store.naming(deleted))
@@ -293,7 +308,7 @@ func TestFinalizerReadsATypeRegisteredTwiceOnce(t *testing.T) {
 	require.NoError(t, logic.Create(context.Background(), twice))
 	project := &resourcemanagerv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p1"}}
 
-	_, err := logic.Finalize(context.Background(), project)
+	err := clearThenFinalize(logic, project)
 
 	require.NoError(t, err)
 	require.Empty(t, store.naming(deleted))
@@ -311,10 +326,10 @@ func TestFinalizerHoldsWhileATupleNamingTheObjectRemains(t *testing.T) {
 	logic := newFinalizerLogic(t, store)
 	project := &resourcemanagerv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p1"}}
 
-	_, err := logic.Finalize(context.Background(), project)
+	err := clearThenFinalize(logic, project)
 	require.Error(t, err, "the finalizer finished while a tuple named the Project")
 
-	_, err = logic.Finalize(context.Background(), project)
+	err = clearThenFinalize(logic, project)
 	require.NoError(t, err)
 	require.Empty(t, store.naming(deleted))
 }

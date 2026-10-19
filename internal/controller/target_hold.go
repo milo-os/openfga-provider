@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	resourcemanagerv1alpha1 "go.miloapis.com/milo/pkg/apis/resourcemanager/v1alpha1"
@@ -27,13 +28,30 @@ var miloFinalizers = []string{
 	"resourcemanager.miloapis.com/organization-namespace",
 }
 
-// targetLocks serialises, per OpenFGA object, every "check the object's hold,
-// then write a tuple naming it" with the object's finalizer's "clear, read
-// again, release". Whichever runs first, no tuple outlives the object: a write
-// that runs first is cleared, and a check that runs second sees the deletion.
-// One leader runs every controller, so a lock in the process is enough. No
-// goroutine holds two keys, which a hashed key mutex requires.
-var targetLocks = keymutex.NewHashed(0)
+// ObjectLocks serialises, per OpenFGA object, every "check the object's hold,
+// then write a tuple naming it" with the object's finalizer's "read again,
+// release". Whichever runs first, no tuple outlives the object: a write that
+// runs first is found by the read, and a check that runs second sees the
+// deletion. One leader runs every controller, so one pool, shared by the
+// reconcilers given it, is enough. Objects that hash to one lock share it, so
+// no goroutine holds two keys.
+type ObjectLocks struct {
+	keys keymutex.KeyMutex
+}
+
+// NewObjectLocks returns a pool of n locks, one per CPU when n <= 0.
+func NewObjectLocks(n int) *ObjectLocks {
+	return &ObjectLocks{keys: keymutex.NewHashed(n)}
+}
+
+// Lock locks the OpenFGA object until the returned function runs.
+func (l *ObjectLocks) Lock(object string) func() {
+	l.keys.LockKey(object)
+	return func() { _ = l.keys.UnlockKey(object) }
+}
+
+// errNoLocks is a reconciler's setup error when it is given no lock pool.
+var errNoLocks = errors.New("the reconciler needs the object locks it shares with the other reconcilers")
 
 // hold says how our finalizer holds an object that tuples name.
 type hold int
@@ -123,15 +141,4 @@ func holdWithFinalizer(ctx context.Context, c client.Client, obj client.Object) 
 		return fmt.Errorf("failed to add our finalizer to %s %s: %w", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName(), err)
 	}
 	return nil
-}
-
-// fgaObject is the OpenFGA object that names an object of the kind.
-func fgaObject(group, kind, name string) string {
-	return group + "/" + kind + ":" + name
-}
-
-// lockObject locks the OpenFGA object until the returned function runs.
-func lockObject(object string) func() {
-	targetLocks.LockKey(object)
-	return func() { _ = targetLocks.UnlockKey(object) }
 }

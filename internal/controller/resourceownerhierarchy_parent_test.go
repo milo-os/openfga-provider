@@ -31,6 +31,7 @@ func newHierarchyReconciler(t *testing.T, store *fgaTupleStore, objs ...client.O
 		FGAClient:              store,
 		FGAStoreID:             testStoreID,
 		validProjectParentGVKs: projectParentGVKs(),
+		Locks:                  NewObjectLocks(0),
 	}
 }
 
@@ -114,7 +115,7 @@ func TestOrganizationFinalizerWaitsForAParentWrite(t *testing.T) {
 	const org = organizationType + ":org-a"
 	store := &fgaTupleStore{}
 	h := newHierarchyReconciler(t, store, append(hierarchyResources(), ownedProject(), owner(ownerUID, false, resourceOwnerHierarchyFinalizer))...)
-	o := &OrganizationReconciler{Client: h.Client, FGAClient: store, FGAStoreID: testStoreID}
+	o := &OrganizationReconciler{Client: h.Client, FGAClient: store, FGAStoreID: testStoreID, Locks: h.Locks}
 	require.NoError(t, o.registerFinalizer())
 	writing, proceed := make(chan struct{}), make(chan struct{})
 	store.beforeWrite = func(s *fgaTupleStore) {
