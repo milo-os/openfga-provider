@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	iamdatumapiscomv1alpha1 "go.miloapis.com/milo/pkg/apis/iam/v1alpha1"
+	resourcemanagerv1alpha1 "go.miloapis.com/milo/pkg/apis/resourcemanager/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -20,6 +21,9 @@ func protectedResourceScheme(t *testing.T) *runtime.Scheme {
 	}
 	if err := iamdatumapiscomv1alpha1.AddToScheme(s); err != nil {
 		t.Fatalf("add iam scheme: %v", err)
+	}
+	if err := resourcemanagerv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("add resourcemanager scheme: %v", err)
 	}
 	return s
 }
@@ -40,19 +44,20 @@ func newPolicyBindingReconciler(t *testing.T, objs ...client.Object) *PolicyBind
 	s := protectedResourceScheme(t)
 	c := fake.NewClientBuilder().
 		WithScheme(s).
-		WithIndex(&iamdatumapiscomv1alpha1.ProtectedResource{}, protectedResourceServiceKindIndexField, func(rawObj client.Object) []string {
-			pr, ok := rawObj.(*iamdatumapiscomv1alpha1.ProtectedResource)
-			if !ok {
-				return nil
-			}
-			if pr.Spec.ServiceRef.Name == "" || pr.Spec.Kind == "" {
-				return nil
-			}
-			return []string{pr.Spec.ServiceRef.Name + "/" + pr.Spec.Kind}
-		}).
+		WithIndex(&iamdatumapiscomv1alpha1.ProtectedResource{}, protectedResourceServiceKindIndexField, protectedResourceServiceKind).
 		WithObjects(objs...).
 		Build()
 	return &PolicyBindingReconciler{Client: c}
+}
+
+// protectedResourceServiceKind indexes a ProtectedResource as the reconciler's
+// field indexer does.
+func protectedResourceServiceKind(rawObj client.Object) []string {
+	pr, ok := rawObj.(*iamdatumapiscomv1alpha1.ProtectedResource)
+	if !ok || pr.Spec.ServiceRef.Name == "" || pr.Spec.Kind == "" {
+		return nil
+	}
+	return []string{pr.Spec.ServiceRef.Name + "/" + pr.Spec.Kind}
 }
 
 // validateResourceType looks up ProtectedResources via the indexed

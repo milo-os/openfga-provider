@@ -83,6 +83,7 @@ rules:
 - apiGroups:
   - resourcemanager.miloapis.com
   resources:
+  - organizations
   - projects
   verbs:
   - get
@@ -93,6 +94,7 @@ rules:
 - apiGroups:
   - resourcemanager.miloapis.com
   resources:
+  - organizations/finalizers
   - projects/finalizers
   verbs:
   - update

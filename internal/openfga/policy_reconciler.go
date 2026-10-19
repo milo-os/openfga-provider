@@ -29,6 +29,22 @@ type PolicyReconciler struct {
 	// ModelIDProvider pins writes to a known authorization model so OpenFGA
 	// does not resolve the store's latest model on every call. Optional.
 	ModelIDProvider ModelIDProvider
+	// TargetGuard, when set, runs before a write that adds tuples. Optional.
+	TargetGuard TargetGuard
+}
+
+// TargetGuard says whether a binding's target may take new tuples: "" when it
+// may, otherwise why not, in plain words.
+type TargetGuard func(ctx context.Context) (string, error)
+
+// TargetNotHeldError reports tuples that were not written because the
+// binding's target could not take them.
+type TargetNotHeldError struct {
+	Reason string
+}
+
+func (e *TargetNotHeldError) Error() string {
+	return "no permissions written: " + e.Reason
 }
 
 // ReconcilePolicy ensures the correct tuples for a
@@ -185,10 +201,33 @@ func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatum
 		return nil
 	}
 
+	return r.writeGuarded(ctx, writeReq, added)
+}
+
+// writeGuarded asks the guard before a write that adds tuples.
+func (r *PolicyReconciler) writeGuarded(ctx context.Context, writeReq *openfgav1.WriteRequest, added []*openfgav1.TupleKey) error {
+	if err := r.checkTarget(ctx, added); err != nil {
+		return err
+	}
 	if err := writeWithModelTransitionRetry(ctx, r.Client, writeReq, r.ModelIDProvider); err != nil {
 		return fmt.Errorf("failed to write permission tuples: %w", err)
 	}
+	return nil
+}
 
+// checkTarget asks the guard whether the target may take the added tuples. It
+// passes when nothing is added or no guard is set.
+func (r *PolicyReconciler) checkTarget(ctx context.Context, added []*openfgav1.TupleKey) error {
+	if len(added) == 0 || r.TargetGuard == nil {
+		return nil
+	}
+	reason, err := r.TargetGuard(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read the binding's target: %w", err)
+	}
+	if reason != "" {
+		return &TargetNotHeldError{Reason: reason}
+	}
 	return nil
 }
 
