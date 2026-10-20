@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/client-go/discovery"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -207,7 +208,8 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 	}
 	if !permExists {
 		permission := o.buildPermissionString(attributes)
-		logf.FromContext(ctx).Info("permission not found", "attributes", attributes, "permission", permission)
+		notRegisteredReason := o.notRegisteredReason(attributes)
+		logf.FromContext(ctx).Info("permission not found", "attributes", attributes, "permission", permission, "reason", notRegisteredReason)
 		var reason string
 		var notRegisteredErr error
 		if o.EnableSubresourceAuthorization {
@@ -215,7 +217,7 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 		} else {
 			notRegisteredErr = fmt.Errorf("permission '%s' not registered", permission)
 		}
-		authzDecisionsTotal.WithLabelValues(decisionLabel(authorizer.DecisionDeny, notRegisteredErr), scope, attributes.GetAPIGroup(), reasonPermissionNotRegistered).Inc()
+		authzDecisionsTotal.WithLabelValues(decisionLabel(authorizer.DecisionDeny, notRegisteredErr), scope, attributes.GetAPIGroup(), notRegisteredReason).Inc()
 		return authorizer.DecisionDeny, reason, notRegisteredErr
 	}
 
@@ -650,6 +652,55 @@ func (o *SubjectAccessReviewAuthorizer) validatePermissionWithServiceDefaulting(
 		"duration", duration,
 	)
 	return false, nil
+}
+
+func (o *SubjectAccessReviewAuthorizer) notRegisteredReason(attributes authorizer.Attributes) string {
+	if !attributes.IsResourceRequest() {
+		return reasonNonResourceRequest
+	}
+	if served, known := o.isResourceServed(attributes); known && !served {
+		return reasonResourceNotServed
+	}
+	return reasonPermissionNotRegistered
+}
+
+func (o *SubjectAccessReviewAuthorizer) isResourceServed(attributes authorizer.Attributes) (served bool, known bool) {
+	group := attributes.GetAPIGroup()
+	resource := attributes.GetResource()
+	if o.DiscoveryClient == nil || group == "*" || resource == "*" || resource == "" {
+		return false, false
+	}
+
+	groups, err := o.DiscoveryClient.ServerGroups()
+	if err != nil || groups == nil {
+		return false, false
+	}
+
+	requested := attributes.GetAPIVersion()
+	var versions []string
+	for _, g := range groups.Groups {
+		if g.Name != group {
+			continue
+		}
+		for _, v := range g.Versions {
+			if requested == "" || requested == "*" || requested == v.Version {
+				versions = append(versions, v.Version)
+			}
+		}
+	}
+
+	for _, version := range versions {
+		list, err := o.DiscoveryClient.ServerResourcesForGroupVersion(schema.GroupVersion{Group: group, Version: version}.String())
+		if err != nil || list == nil {
+			return false, false
+		}
+		for _, r := range list.APIResources {
+			if r.Name == resource {
+				return true, true
+			}
+		}
+	}
+	return false, true
 }
 
 // getEffectiveAPIGroup returns the API group with service name mapping applied consistently

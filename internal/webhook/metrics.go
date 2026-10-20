@@ -66,6 +66,8 @@ const (
 	reasonHTTPRequest             = "http_request"
 	reasonOpenFGACheck            = "openfga_check"
 	reasonPermissionNotRegistered = "permission_not_registered"
+	reasonResourceNotServed       = "resource_not_served"
+	reasonNonResourceRequest      = "non_resource_request"
 )
 
 func init() {
