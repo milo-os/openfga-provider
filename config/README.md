@@ -151,11 +151,11 @@ component, and a rule evaluator that reads `PrometheusRule` objects.
   minutes, so the first alert cannot fire.
   [Runbook](../docs/runbooks/authz-decision-reason-missing.md)
 
-Both carry `team: platform` and `service: iam` for routing. The first skips
-`coordination.k8s.io`, `notification.miloapis.com` and
-`rbac.authorization.k8s.io`, which refuse a few requests an hour as a matter of
-course, and `flowcontrol.apiserver.k8s.io`, which Milo leaves to Kubernetes RBAC
-and refuses only when a person reads it by hand.
+Both carry `team: platform` and `service: iam` for routing. Kubernetes' own API
+groups, every `*.k8s.io` group, are left to RBAC and never page the first
+alert. `gateway.networking.k8s.io` is the exception because Milo registers it.
+The first alert also skips `notification.miloapis.com`, which refuses a steady
+trickle of requests.
 
 ## Environment Configuration Patterns
 

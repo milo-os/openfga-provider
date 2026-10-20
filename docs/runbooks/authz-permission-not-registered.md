@@ -18,17 +18,15 @@ The webhook counts each of these once in `authz_decisions_total` with
 authorization is on and `error` when it is off. The alert ignores `decision`, so
 it fires in both modes.
 
-Three API groups refuse a request or two an hour as a matter of course and are
-excluded: `coordination.k8s.io`, `notification.miloapis.com` and
-`rbac.authorization.k8s.io`. Milo registers no permissions for the two
-Kubernetes groups, and the trickle in its own notification group is steady. A
-rise in one of those does not fire this alert.
+Kubernetes' own API groups, every `*.k8s.io` group, are left to RBAC and never
+page. Milo registers no permissions for them, so a refusal there is by design,
+whether it is a controller's lease update or a person running `kubectl get
+flowschemas` against Milo. `gateway.networking.k8s.io` is the exception because
+Milo registers it, so its refusals still page.
 
-`flowcontrol.apiserver.k8s.io` is excluded too. Milo serves its priority and
-fairness settings to operators only and leaves them to Kubernetes RBAC, so
-nothing registers a permission for them. A person running `kubectl get
-flowschemas` against Milo is refused by design, and three such reads in a minute
-would otherwise page.
+The core API group still pages, since Milo registers core resources.
+`notification.miloapis.com` is skipped because it refuses a steady trickle of
+requests. A rise in a skipped group does not fire this alert.
 
 ## How to investigate
 
