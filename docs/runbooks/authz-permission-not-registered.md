@@ -24,6 +24,12 @@ excluded: `coordination.k8s.io`, `notification.miloapis.com` and
 Kubernetes groups, and the trickle in its own notification group is steady. A
 rise in one of those does not fire this alert.
 
+`flowcontrol.apiserver.k8s.io` is excluded too. Milo serves its priority and
+fairness settings to operators only and leaves them to Kubernetes RBAC, so
+nothing registers a permission for them. A person running `kubectl get
+flowschemas` against Milo is refused by design, and three such reads in a minute
+would otherwise page.
+
 ## How to investigate
 
 The commands below assume the default namespace from `config/base`,

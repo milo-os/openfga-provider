@@ -154,7 +154,8 @@ component, and a rule evaluator that reads `PrometheusRule` objects.
 Both carry `team: platform` and `service: iam` for routing. The first skips
 `coordination.k8s.io`, `notification.miloapis.com` and
 `rbac.authorization.k8s.io`, which refuse a few requests an hour as a matter of
-course.
+course, and `flowcontrol.apiserver.k8s.io`, which Milo leaves to Kubernetes RBAC
+and refuses only when a person reads it by hand.
 
 ## Environment Configuration Patterns
 
