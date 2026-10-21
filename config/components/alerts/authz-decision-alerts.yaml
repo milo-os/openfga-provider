@@ -12,7 +12,9 @@ spec:
         - alert: AuthzPermissionNotRegistered
           expr: |
             sum by (resource_group) (
-              increase(authz_decisions_total{reason="permission_not_registered", resource_group!~"coordination.k8s.io|notification.miloapis.com|rbac.authorization.k8s.io"}[15m])
+              increase(authz_decisions_total{reason="permission_not_registered", resource_group!~".*\\.k8s\\.io|notification\\.miloapis\\.com"}[15m])
+              or
+              increase(authz_decisions_total{reason="permission_not_registered", resource_group="gateway.networking.k8s.io"}[15m])
             ) >= 3
           for: 5m
           labels:
