@@ -23,7 +23,8 @@ import (
 	"k8s.io/api/authentication/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/discovery/cached/disk"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -178,17 +179,11 @@ func runWebhookServer(
 		return fmt.Errorf("failed to add iamv1alpha1 to scheme: %w", err)
 	}
 
-	// Create temporary directory for discovery cache (will be cleaned up on process exit)
-	tempDir, err := os.MkdirTemp("", "auth-provider-discovery-cache-")
+	liveDiscovery, err := discovery.NewDiscoveryClientForConfig(restConfig)
 	if err != nil {
-		return fmt.Errorf("failed to create temporary cache directory: %w", err)
+		return fmt.Errorf("failed to create discovery client: %w", err)
 	}
-
-	// Create TTL-aware cached discovery client using native disk cache
-	discoveryClient, err := disk.NewCachedDiscoveryClientForConfig(restConfig, tempDir, "", discoveryCacheTTL)
-	if err != nil {
-		return fmt.Errorf("failed to create cached discovery client: %w", err)
-	}
+	discoveryClient := webhook.NewExpiringDiscoveryClient(memory.NewMemCacheClient(liveDiscovery), discoveryCacheTTL)
 
 	// Setup Manager
 	entryLog.Info("setting up manager")

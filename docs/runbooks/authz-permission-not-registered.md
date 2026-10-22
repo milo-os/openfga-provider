@@ -53,6 +53,21 @@ The commands below assume the default namespace from `config/base`,
    )
    ```
 
+   Refusals for something the API server does not serve are counted under
+   other reasons and never fire this alert: `resource_not_served` for a
+   resource discovery does not list, such as `nodes` or impersonating a user on
+   Milo, and `non_resource_request` for a URL such as `/metrics`. Discovery is
+   cached for `--discovery-cache-ttl`, 5 minutes by default, so a resource
+   served in the last few minutes counts as not served until the cache
+   refreshes.
+
+   A refusal stays `permission_not_registered` whenever discovery cannot
+   answer: discovery is down, or the requested group version failed discovery,
+   such as one an unavailable aggregated APIService marks stale. A page during
+   an aggregated API outage can therefore be the outage itself. Check
+   `kubectl get apiservices` for one that is not `Available` before declaring a
+   permission.
+
 3. **Decide whether the permission should exist.** A permission for a resource
    or subresource that a service serves must be declared by that service. A
    newly served subresource, or subresource authorization being switched on,

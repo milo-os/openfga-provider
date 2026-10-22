@@ -81,6 +81,14 @@ func (m *mockDiscoveryClient) ServerResourcesForGroupVersion(groupVersion string
 	return nil, errors.New("ServerResourcesForGroupVersion not implemented")
 }
 
+func (m *mockDiscoveryClient) ServerGroups() (*metav1.APIGroupList, error) {
+	return nil, errors.New("ServerGroups not implemented")
+}
+
+func (m *mockDiscoveryClient) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	return nil, nil, errors.New("ServerGroupsAndResources not implemented")
+}
+
 func TestSubjectAccessReviewAuthorizer_Authorize_Integration(t *testing.T) {
 
 	testCases := []struct {

@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -15,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/client-go/discovery"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -207,7 +209,8 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 	}
 	if !permExists {
 		permission := o.buildPermissionString(attributes)
-		logf.FromContext(ctx).Info("permission not found", "attributes", attributes, "permission", permission)
+		notRegisteredReason := o.notRegisteredReason(attributes)
+		logf.FromContext(ctx).Info("permission not found", "attributes", attributes, "permission", permission, "reason", notRegisteredReason)
 		var reason string
 		var notRegisteredErr error
 		if o.EnableSubresourceAuthorization {
@@ -215,7 +218,7 @@ func (o *SubjectAccessReviewAuthorizer) Authorize(ctx context.Context, attribute
 		} else {
 			notRegisteredErr = fmt.Errorf("permission '%s' not registered", permission)
 		}
-		authzDecisionsTotal.WithLabelValues(decisionLabel(authorizer.DecisionDeny, notRegisteredErr), scope, attributes.GetAPIGroup(), reasonPermissionNotRegistered).Inc()
+		authzDecisionsTotal.WithLabelValues(decisionLabel(authorizer.DecisionDeny, notRegisteredErr), scope, attributes.GetAPIGroup(), notRegisteredReason).Inc()
 		return authorizer.DecisionDeny, reason, notRegisteredErr
 	}
 
@@ -650,6 +653,72 @@ func (o *SubjectAccessReviewAuthorizer) validatePermissionWithServiceDefaulting(
 		"duration", duration,
 	)
 	return false, nil
+}
+
+func (o *SubjectAccessReviewAuthorizer) notRegisteredReason(attributes authorizer.Attributes) string {
+	if !attributes.IsResourceRequest() {
+		return reasonNonResourceRequest
+	}
+	if served, known := o.isResourceServed(attributes); known && !served {
+		return reasonResourceNotServed
+	}
+	return reasonPermissionNotRegistered
+}
+
+// isResourceServed reports known only when discovery is healthy for every
+// requested version of the group. A version that failed discovery, such as one
+// an unavailable aggregated APIService marks stale, makes the answer unknown.
+func (o *SubjectAccessReviewAuthorizer) isResourceServed(attributes authorizer.Attributes) (served bool, known bool) {
+	group := attributes.GetAPIGroup()
+	resource := attributes.GetResource()
+	if o.DiscoveryClient == nil || group == "*" || resource == "*" || resource == "" {
+		return false, false
+	}
+
+	groups, resourceLists, err := o.DiscoveryClient.ServerGroupsAndResources()
+	var failed *discovery.ErrGroupDiscoveryFailed
+	if err != nil && !errors.As(err, &failed) {
+		return false, false
+	}
+	if groups == nil {
+		return false, false
+	}
+
+	requested := attributes.GetAPIVersion()
+	matches := func(gv schema.GroupVersion) bool {
+		return gv.Group == group && (requested == "" || requested == "*" || requested == gv.Version)
+	}
+
+	if failed != nil {
+		for gv := range failed.Groups {
+			if matches(gv) {
+				return false, false
+			}
+		}
+	}
+
+	for _, g := range groups {
+		if g != nil && g.Name == group && len(g.Versions) == 0 {
+			return false, false
+		}
+	}
+
+	for _, list := range resourceLists {
+		if list == nil {
+			continue
+		}
+		gv, err := schema.ParseGroupVersion(list.GroupVersion)
+		if err != nil || !matches(gv) {
+			continue
+		}
+		for _, r := range list.APIResources {
+			if r.Name == resource {
+				return true, true
+			}
+		}
+	}
+
+	return false, true
 }
 
 // getEffectiveAPIGroup returns the API group with service name mapping applied consistently

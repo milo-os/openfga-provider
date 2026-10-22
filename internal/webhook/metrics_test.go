@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,12 +15,20 @@ import (
 	"google.golang.org/grpc"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/client-go/discovery"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 const metricsTestGroup = "metrics.example"
+
+const (
+	servedGroup        = "logs.example.miloapis.com"
+	servedResource     = "queries"
+	servedCoreResource = "secrets"
+)
 
 func decisionCount(t *testing.T, labels map[string]string) float64 {
 	t.Helper()
@@ -156,4 +165,115 @@ func TestOpenFGADecisionCarriesReason(t *testing.T) {
 	require.Equal(t, authorizer.DecisionAllow, decision)
 	require.Equal(t, before+1, decisionCount(t, labels))
 	require.Zero(t, decisionCount(t, map[string]string{"reason": ""}), "every series carries a reason")
+}
+
+type servedResources struct {
+	discovery.DiscoveryInterface
+	resources map[string][]string
+	err       error
+}
+
+func (s servedResources) ServerGroups() (*metav1.APIGroupList, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	list := &metav1.APIGroupList{}
+	for gv := range s.resources {
+		parsed, err := schema.ParseGroupVersion(gv)
+		if err != nil {
+			return nil, err
+		}
+		list.Groups = append(list.Groups, metav1.APIGroup{
+			Name:     parsed.Group,
+			Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: gv, Version: parsed.Version}},
+		})
+	}
+	return list, nil
+}
+
+func (s servedResources) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	return discovery.ServerGroupsAndResources(s)
+}
+
+func (s servedResources) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	names, ok := s.resources[groupVersion]
+	if !ok {
+		return nil, errors.New("group version not served")
+	}
+	list := &metav1.APIResourceList{GroupVersion: groupVersion}
+	for _, name := range names {
+		list.APIResources = append(list.APIResources, metav1.APIResource{Name: name})
+	}
+	return list, nil
+}
+
+func TestRefusalReasonSeparatesUnservedRequests(t *testing.T) {
+	registered := []iam.ProtectedResource{
+		{Spec: iam.ProtectedResourceSpec{ServiceRef: iam.ServiceReference{Name: "core.miloapis.com"}, Plural: servedCoreResource, Kind: "Secret", Permissions: []string{"get", "list"}}},
+	}
+	served := servedResources{resources: map[string][]string{
+		"v1":                {"configmaps", "namespaces", servedCoreResource},
+		servedGroup + "/v1": {servedResource},
+	}}
+	staff := &user.DefaultInfo{UID: "staff-id", Name: "staff", Groups: []string{"system:authenticated"}}
+
+	for _, tc := range []struct {
+		name      string
+		discovery discovery.DiscoveryInterface
+		attrs     authorizer.AttributesRecord
+		reason    string
+	}{
+		{
+			name:      "impersonating a user",
+			discovery: served,
+			attrs:     authorizer.AttributesRecord{User: staff, ResourceRequest: true, Resource: "users", Name: "system:control", Verb: "impersonate"},
+			reason:    reasonResourceNotServed,
+		},
+		{
+			name:      "listing nodes the server does not serve",
+			discovery: served,
+			attrs:     authorizer.AttributesRecord{User: staff, ResourceRequest: true, APIVersion: "v1", Resource: "nodes", Verb: "list"},
+			reason:    reasonResourceNotServed,
+		},
+		{
+			name:      "asking for an unserved version of a served group",
+			discovery: served,
+			attrs:     authorizer.AttributesRecord{User: staff, ResourceRequest: true, APIGroup: servedGroup, APIVersion: "v9", Resource: servedResource, Verb: "create"},
+			reason:    reasonResourceNotServed,
+		},
+		{
+			name:      "reading a metrics URL",
+			discovery: served,
+			attrs:     authorizer.AttributesRecord{User: staff, ResourceRequest: false, Path: "/metrics", Verb: "get"},
+			reason:    reasonNonResourceRequest,
+		},
+		{
+			name:      "a served core resource missing a verb",
+			discovery: served,
+			attrs:     authorizer.AttributesRecord{User: staff, ResourceRequest: true, APIVersion: "v1", Resource: servedCoreResource, Verb: "deletecollection"},
+			reason:    reasonPermissionNotRegistered,
+		},
+		{
+			name:      "a served resource with no registration",
+			discovery: served,
+			attrs:     authorizer.AttributesRecord{User: staff, ResourceRequest: true, APIGroup: servedGroup, Resource: servedResource, Verb: "create"},
+			reason:    reasonPermissionNotRegistered,
+		},
+		{
+			name:      "discovery unavailable",
+			discovery: servedResources{err: errors.New("discovery down")},
+			attrs:     authorizer.AttributesRecord{User: staff, ResourceRequest: true, Resource: "users", Verb: "impersonate"},
+			reason:    reasonPermissionNotRegistered,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			labels := map[string]string{"decision": "denied", "scope": "cluster", "resource_group": tc.attrs.APIGroup, "reason": tc.reason}
+			before := decisionCount(t, labels)
+
+			auth := &SubjectAccessReviewAuthorizer{EnableSubresourceAuthorization: true, ProtectedResourceCache: newProtectedResourceCacheFromItems(registered), DiscoveryClient: tc.discovery}
+			decision, _, _ := auth.Authorize(context.Background(), tc.attrs)
+			require.Equal(t, authorizer.DecisionDeny, decision)
+			require.Equal(t, before+1, decisionCount(t, labels))
+		})
+	}
 }
