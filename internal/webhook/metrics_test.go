@@ -191,6 +191,10 @@ func (s servedResources) ServerGroups() (*metav1.APIGroupList, error) {
 	return list, nil
 }
 
+func (s servedResources) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	return discovery.ServerGroupsAndResources(s)
+}
+
 func (s servedResources) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
 	names, ok := s.resources[groupVersion]
 	if !ok {

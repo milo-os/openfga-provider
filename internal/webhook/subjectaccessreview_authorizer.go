@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -664,6 +665,9 @@ func (o *SubjectAccessReviewAuthorizer) notRegisteredReason(attributes authorize
 	return reasonPermissionNotRegistered
 }
 
+// isResourceServed reports known only when discovery is healthy for every
+// requested version of the group. A version that failed discovery, such as one
+// an unavailable aggregated APIService marks stale, makes the answer unknown.
 func (o *SubjectAccessReviewAuthorizer) isResourceServed(attributes authorizer.Attributes) (served bool, known bool) {
 	group := attributes.GetAPIGroup()
 	resource := attributes.GetResource()
@@ -671,28 +675,41 @@ func (o *SubjectAccessReviewAuthorizer) isResourceServed(attributes authorizer.A
 		return false, false
 	}
 
-	groups, err := o.DiscoveryClient.ServerGroups()
-	if err != nil || groups == nil {
+	groups, resourceLists, err := o.DiscoveryClient.ServerGroupsAndResources()
+	var failed *discovery.ErrGroupDiscoveryFailed
+	if err != nil && !errors.As(err, &failed) {
+		return false, false
+	}
+	if groups == nil {
 		return false, false
 	}
 
 	requested := attributes.GetAPIVersion()
-	var versions []string
-	for _, g := range groups.Groups {
-		if g.Name != group {
-			continue
-		}
-		for _, v := range g.Versions {
-			if requested == "" || requested == "*" || requested == v.Version {
-				versions = append(versions, v.Version)
+	matches := func(gv schema.GroupVersion) bool {
+		return gv.Group == group && (requested == "" || requested == "*" || requested == gv.Version)
+	}
+
+	if failed != nil {
+		for gv := range failed.Groups {
+			if matches(gv) {
+				return false, false
 			}
 		}
 	}
 
-	for _, version := range versions {
-		list, err := o.DiscoveryClient.ServerResourcesForGroupVersion(schema.GroupVersion{Group: group, Version: version}.String())
-		if err != nil || list == nil {
+	for _, g := range groups {
+		if g != nil && g.Name == group && len(g.Versions) == 0 {
 			return false, false
+		}
+	}
+
+	for _, list := range resourceLists {
+		if list == nil {
+			continue
+		}
+		gv, err := schema.ParseGroupVersion(list.GroupVersion)
+		if err != nil || !matches(gv) {
+			continue
 		}
 		for _, r := range list.APIResources {
 			if r.Name == resource {
@@ -700,6 +717,7 @@ func (o *SubjectAccessReviewAuthorizer) isResourceServed(attributes authorizer.A
 			}
 		}
 	}
+
 	return false, true
 }
 
