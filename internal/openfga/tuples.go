@@ -15,6 +15,11 @@ const MaxTuplesPerWrite = 100
 // later honour it; an older server ignores the field and fails as before.
 const onMissingIgnore = "ignore"
 
+// onDuplicateIgnore makes a write skip a tuple that already exists, so a tuple
+// another writer added first does not fail the batch. OpenFGA v1.10.0 and
+// later honour it, as they do onMissingIgnore.
+const onDuplicateIgnore = "ignore"
+
 // DeleteTuples deletes the tuples in writes of at most MaxTuplesPerWrite,
 // skipping any that is already gone.
 func DeleteTuples(ctx context.Context, client openfgav1.OpenFGAServiceClient, storeID, modelID string, tuples []*openfgav1.TupleKey) error {

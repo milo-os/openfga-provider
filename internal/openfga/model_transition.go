@@ -27,35 +27,20 @@ func writeWithModelTransitionRetry(
 	if err == nil {
 		return nil
 	}
-	if request.GetAuthorizationModelId() == "" ||
-		request.GetWrites() == nil || len(request.GetWrites().GetTupleKeys()) == 0 ||
-		request.GetDeletes() != nil ||
-		!strings.Contains(err.Error(), "Invalid tuple") {
+	if !mayBeModelTransition(request, err) {
 		return err
 	}
 
-	models, readErr := client.ReadAuthorizationModels(ctx, &openfgav1.ReadAuthorizationModelsRequest{
-		StoreId: request.GetStoreId(),
-	})
+	latestModel, readErr := latestAuthorizationModel(ctx, client, request.GetStoreId())
 	if readErr != nil {
 		return fmt.Errorf("failed to read the latest authorization model after a tuple write failed: %w", readErr)
 	}
-	if len(models.GetAuthorizationModels()) == 0 {
-		return err
-	}
 
-	latestModelID := models.GetAuthorizationModels()[0].GetId()
+	latestModelID := latestModel.GetId()
 	if latestModelID == "" || latestModelID == request.GetAuthorizationModelId() {
 		return err
 	}
-	latestModelResponse, readErr := client.ReadAuthorizationModel(ctx, &openfgav1.ReadAuthorizationModelRequest{
-		StoreId: request.GetStoreId(),
-		Id:      latestModelID,
-	})
-	if readErr != nil {
-		return fmt.Errorf("failed to read latest authorization model %q after a tuple write failed: %w", latestModelID, readErr)
-	}
-	if !modelSupportsTupleWrites(latestModelResponse.GetAuthorizationModel(), request.GetWrites().GetTupleKeys()) {
+	if !modelSupportsTupleWrites(latestModel, request.GetWrites().GetTupleKeys()) {
 		return err
 	}
 
@@ -70,6 +55,15 @@ func writeWithModelTransitionRetry(
 		return fmt.Errorf("failed to write permission tuples with latest authorization model %q: %w", latestModelID, retryErr)
 	}
 	return nil
+}
+
+// mayBeModelTransition reports whether a failed write can be the transition's: additions only, pinned to a model ID,
+// and refused as an invalid tuple.
+func mayBeModelTransition(request *openfgav1.WriteRequest, err error) bool {
+	return request.GetAuthorizationModelId() != "" &&
+		len(request.GetWrites().GetTupleKeys()) > 0 &&
+		request.GetDeletes() == nil &&
+		strings.Contains(err.Error(), "Invalid tuple")
 }
 
 func modelSupportsTupleWrites(model *openfgav1.AuthorizationModel, tupleKeys []*openfgav1.TupleKey) bool {

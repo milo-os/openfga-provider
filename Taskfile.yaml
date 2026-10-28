@@ -24,7 +24,7 @@ vars:
   CONTROLLER_TOOLS_VERSION: 'v0.17.2'
   GOLANGCI_LINT_VERSION:
     sh: test -f .golangci-version && cat .golangci-version || echo "v2.1.6"
-  CHAINSAW_VERSION: 'v0.2.14'
+  CHAINSAW_VERSION: 'v0.2.15'
 
   # Kubernetes versions for testing
   ENVTEST_VERSION: "latest"
