@@ -59,8 +59,8 @@ type SystemGroupReconciler struct {
 	mgr             mcmanager.Manager
 }
 
-// +kubebuilder:rbac:groups=iam.miloapis.com,resources=users;machineaccounts,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=iam.miloapis.com,resources=users/finalizers;machineaccounts/finalizers,verbs=update
+// +kubebuilder:rbac:groups=iam.miloapis.com,resources=users;serviceaccounts,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=iam.miloapis.com,resources=users/finalizers;serviceaccounts/finalizers,verbs=update
 
 // Reconcile is a no-op as the manager uses resource-specific entry points below.
 func (r *SystemGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -68,7 +68,7 @@ func (r *SystemGroupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 // SetupWithManager sets up the User controller only (single-cluster).
-// For multicluster support (including MachineAccount controller), use SetupWithManagerMultiCluster.
+// For multicluster support (including the ServiceAccount controller), use SetupWithManagerMultiCluster.
 func (r *SystemGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&iamv1alpha1.User{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
