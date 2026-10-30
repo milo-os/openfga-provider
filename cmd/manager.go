@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -271,16 +272,18 @@ func runManager(
 	// mcMgr is the primary manager. It owns leader election, metrics, and
 	// health probes. All multicluster controllers (ServiceAccount) register here.
 	mcMgr, err := mcmanager.New(upstreamClusterConfig, provider, ctrl.Options{
-		Scheme:                     scheme,
-		Metrics:                    metricsserver.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress:     probeAddr,
-		LeaderElection:             enableLeaderElection,
-		LeaderElectionID:           leaderElectionID,
-		LeaderElectionNamespace:    leaderElectionNamespace,
-		LeaderElectionResourceLock: leaderElectionResourceLock,
-		LeaseDuration:              &leaseDuration,
-		RenewDeadline:              &renewDeadline,
-		RetryPeriod:                &retryPeriod,
+		Scheme:                        scheme,
+		Metrics:                       metricsserver.Options{BindAddress: metricsAddr},
+		HealthProbeBindAddress:        probeAddr,
+		LeaderElection:                enableLeaderElection,
+		LeaderElectionID:              leaderElectionID,
+		LeaderElectionNamespace:       leaderElectionNamespace,
+		LeaderElectionResourceLock:    leaderElectionResourceLock,
+		LeaseDuration:                 &leaseDuration,
+		RenewDeadline:                 &renewDeadline,
+		RetryPeriod:                   &retryPeriod,
+		LeaderElectionConfig:          leaderElectionRestConfig(upstreamClusterConfig),
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		return fmt.Errorf("unable to start multicluster manager: %w", err)
@@ -425,30 +428,45 @@ func runManager(
 	}
 
 	ctx := ctrl.SetupSignalHandler()
-	g, ctx := errgroup.WithContext(ctx)
 
+	workers := make([]func(context.Context) error, 0, len(runnables)+1)
 	for _, runnable := range runnables {
-		g.Go(func() error {
-			return ignoreCanceled(runnable.Start(ctx))
-		})
+		workers = append(workers, runnable.Start)
 	}
-
 	// Run the provider, which calls Engage to register the cluster with mcMgr.
-	setupLog.Info("starting cluster provider")
-	g.Go(func() error {
-		return ignoreCanceled(provider.Start(ctx, mcMgr))
+	workers = append(workers, func(ctx context.Context) error {
+		return provider.Start(ctx, mcMgr)
 	})
 
-	setupLog.Info("starting multicluster manager")
-	g.Go(func() error {
-		return ignoreCanceled(mcMgr.Start(ctx))
-	})
-
-	if err := g.Wait(); err != nil {
+	setupLog.Info("starting cluster provider and multicluster manager")
+	if err := runUntilManagerStops(ctx, mcMgr.Start, workers...); err != nil {
 		return fmt.Errorf("manager error: %w", err)
 	}
 
 	return nil
+}
+
+func runUntilManagerStops(
+	ctx context.Context,
+	startManager func(context.Context) error,
+	workers ...func(context.Context) error,
+) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	g, ctx := errgroup.WithContext(ctx)
+
+	for _, work := range workers {
+		g.Go(func() error {
+			return ignoreCanceled(work(ctx))
+		})
+	}
+
+	g.Go(func() error {
+		defer cancel()
+		return ignoreCanceled(startManager(ctx))
+	})
+
+	return g.Wait()
 }
 
 type runnableProvider interface {
@@ -556,6 +574,23 @@ func initializeClusterDiscovery(
 	}
 
 	return runnables, provider, nil
+}
+
+const (
+	leaderElectionQPS   = 5
+	leaderElectionBurst = 10
+)
+
+func leaderElectionRestConfig(base *rest.Config) *rest.Config {
+	cfg := rest.CopyConfig(base)
+	cfg.RateLimiter = nil
+	cfg.QPS = leaderElectionQPS
+	cfg.Burst = leaderElectionBurst
+	cfg.Dial = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return cfg
 }
 
 func ignoreCanceled(err error) error {
