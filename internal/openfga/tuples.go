@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // MaxTuplesPerWrite is OpenFGA's default limit on the tuples in one Write.
@@ -21,17 +23,29 @@ const onMissingIgnore = "ignore"
 const onDuplicateIgnore = "ignore"
 
 // DeleteTuples deletes the tuples in writes of at most MaxTuplesPerWrite,
-// skipping any that is already gone.
+// skipping any that is already gone. A timed-out delete has an unknown outcome;
+// retry it idempotently in smaller batches and retain that size for this cleanup.
 func DeleteTuples(ctx context.Context, client openfgav1.OpenFGAServiceClient, storeID, modelID string, tuples []*openfgav1.TupleKey) error {
-	for start := 0; start < len(tuples); start += MaxTuplesPerWrite {
-		batch := tuples[start:min(start+MaxTuplesPerWrite, len(tuples))]
+	batchSize := MaxTuplesPerWrite
+	for start := 0; start < len(tuples); {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("failed to delete tuples: %w", err)
+		}
+		batch := tuples[start:min(start+batchSize, len(tuples))]
 		if _, err := client.Write(ctx, &openfgav1.WriteRequest{
 			StoreId:              storeID,
 			AuthorizationModelId: modelID,
 			Deletes:              &openfgav1.WriteRequestDeletes{TupleKeys: convertTuplesForDelete(batch), OnMissing: onMissingIgnore},
 		}); err != nil {
+			// OpenFGA returns its own deadline code as well as the standard gRPC code.
+			code := status.Code(err)
+			if ctx.Err() == nil && len(batch) > 1 && (code == codes.DeadlineExceeded || code == codes.Code(openfgav1.InternalErrorCode_deadline_exceeded)) {
+				batchSize = len(batch) / 2
+				continue
+			}
 			return fmt.Errorf("failed to delete tuples: %w", err)
 		}
+		start += len(batch)
 	}
 	return nil
 }
