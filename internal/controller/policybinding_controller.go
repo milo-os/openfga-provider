@@ -35,6 +35,10 @@ import (
 
 const (
 	policyBindingFinalizerKey = "iam.miloapis.com/policybinding"
+	// programmedTupleFingerprintAnnotation records the desired tuple set only
+	// after OpenFGA has converged to it. Matching fingerprints can skip the
+	// expensive per-subject OpenFGA reads during rollout and restart re-lists.
+	programmedTupleFingerprintAnnotation = "iam.miloapis.com/programmed-tuple-fingerprint"
 	// defaultPolicyBindingMaxConcurrentReconciles allows the controller to drain
 	// the workqueue faster on clusters with many PolicyBindings.
 	defaultPolicyBindingMaxConcurrentReconciles = 8
@@ -457,43 +461,55 @@ func (r *PolicyBindingReconciler) reconcileOpenFGAPolicy(ctx context.Context, po
 		TargetGuard:                    r.targetGuard(policyBinding),
 	}
 
-	if err := r.reconcilePolicyLocked(ctx, &policyReconciler, policyBinding); err != nil {
-		var notHeld *openfga.TargetNotHeldError
-		if errors.As(err, &notHeld) {
-			log.Info("Deferred the binding's write", "reason", err.Error())
-			return r.deferWrite(ctx, policyBinding, oldStatus, currentGeneration, notHeld.Reason)
-		}
-		log.Error(err, "Failed to reconcile authorization binding")
+	fingerprint, fingerprintErr := policyReconciler.PolicyFingerprint(ctx, *policyBinding)
+	alreadyProgrammed := fingerprintErr == nil && policyBinding.Annotations[programmedTupleFingerprintAnnotation] == fingerprint
 
-		// Default reason for failure.
-		reason := "BindingCreationFailed"
-		// Check if the error from OpenFGA reconciliation is specifically due to the Role not being found. This allows for a
-		// more precise status condition.
-		if strings.Contains(err.Error(), "not found") && strings.Contains(err.Error(), "role '") {
-			reason = "RoleNotFoundForBinding"
-			// Set the specific RoleValid condition to False.
+	if !alreadyProgrammed {
+		programmedFingerprint, err := r.reconcilePolicyLocked(ctx, &policyReconciler, policyBinding)
+		if err != nil {
+			var notHeld *openfga.TargetNotHeldError
+			if errors.As(err, &notHeld) {
+				log.Info("Deferred the binding's write", "reason", err.Error())
+				return r.deferWrite(ctx, policyBinding, oldStatus, currentGeneration, notHeld.Reason)
+			}
+			log.Error(err, "Failed to reconcile authorization binding")
+
+			// Default reason for failure.
+			reason := "BindingCreationFailed"
+			// Check if the error from OpenFGA reconciliation is specifically due to the Role not being found. This allows for a
+			// more precise status condition.
+			if strings.Contains(err.Error(), "not found") && strings.Contains(err.Error(), "role '") {
+				reason = "RoleNotFoundForBinding"
+				// Set the specific RoleValid condition to False.
+				meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
+					Type:               ConditionTypeRoleValid,
+					Status:             metav1.ConditionFalse,
+					Reason:             reason,
+					Message:            err.Error(),
+					LastTransitionTime: metav1.Now(),
+				})
+			}
+
+			// Set the overall Ready condition to False due to the OpenFGA reconciliation failure.
 			meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
-				Type:               ConditionTypeRoleValid,
+				Type:               "Ready",
 				Status:             metav1.ConditionFalse,
 				Reason:             reason,
-				Message:            err.Error(),
+				Message:            fmt.Sprintf("Failed to create authorization binding: %s", err.Error()),
 				LastTransitionTime: metav1.Now(),
 			})
+			if statusErr := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); statusErr != nil {
+				log.Error(statusErr, "Failed to update PolicyBinding status after reconciliation error")
+			}
+			// Requeue because OpenFGA reconciliation failed.
+			return ctrl.Result{}, err
 		}
 
-		// Set the overall Ready condition to False due to the OpenFGA reconciliation failure.
-		meta.SetStatusCondition(&policyBinding.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionFalse,
-			Reason:             reason,
-			Message:            fmt.Sprintf("Failed to create authorization binding: %s", err.Error()),
-			LastTransitionTime: metav1.Now(),
-		})
-		if statusErr := r.updatePolicyBindingStatus(ctx, policyBinding, oldStatus, currentGeneration); statusErr != nil {
-			log.Error(statusErr, "Failed to update PolicyBinding status after reconciliation error")
+		if err := r.recordProgrammedTupleFingerprint(ctx, policyBinding, programmedFingerprint); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to record programmed tuple fingerprint: %w", err)
 		}
-		// Requeue because OpenFGA reconciliation failed.
-		return ctrl.Result{}, err
+	} else {
+		log.V(1).Info("PolicyBinding tuple fingerprint unchanged; skipping OpenFGA reconciliation")
 	}
 
 	// If OpenFGA reconciliation was successful, it implies the RoleRef was valid (i.e., the role was found and usable by
@@ -524,6 +540,15 @@ func (r *PolicyBindingReconciler) reconcileOpenFGAPolicy(ctx context.Context, po
 	return ctrl.Result{}, nil
 }
 
+func (r *PolicyBindingReconciler) recordProgrammedTupleFingerprint(ctx context.Context, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding, fingerprint string) error {
+	before := policyBinding.DeepCopy()
+	if policyBinding.Annotations == nil {
+		policyBinding.Annotations = make(map[string]string)
+	}
+	policyBinding.Annotations[programmedTupleFingerprintAnnotation] = fingerprint
+	return r.Patch(ctx, policyBinding, client.MergeFrom(before))
+}
+
 // targetGuard returns the check run before a write that adds tuples, for a
 // binding whose target our finalizer holds: one live read of the target, and
 // our finalizer added when it is missing, so a write lands only on a target the
@@ -549,15 +574,15 @@ func (r *PolicyBindingReconciler) targetGuard(policyBinding *iamdatumapiscomv1al
 // reconcilePolicyLocked reconciles the binding's tuples under its target's lock
 // when the target is guarded, so the target's finalizer cannot read and
 // release it between the check and the write.
-func (r *PolicyBindingReconciler) reconcilePolicyLocked(ctx context.Context, policyReconciler *openfga.PolicyReconciler, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding) error {
+func (r *PolicyBindingReconciler) reconcilePolicyLocked(ctx context.Context, policyReconciler *openfga.PolicyReconciler, policyBinding *iamdatumapiscomv1alpha1.PolicyBinding) (string, error) {
 	if policyReconciler.TargetGuard != nil {
 		object, err := openfga.TargetObjectFromResourceSelector(policyBinding.Spec.ResourceSelector)
 		if err != nil {
-			return err
+			return "", err
 		}
 		defer r.Locks.Lock(object)()
 	}
-	return policyReconciler.ReconcilePolicy(ctx, *policyBinding)
+	return policyReconciler.ReconcilePolicyWithFingerprint(ctx, *policyBinding)
 }
 
 // deferWrite says, in plain words, why no permissions were written, and

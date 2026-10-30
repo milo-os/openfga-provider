@@ -2,7 +2,9 @@ package openfga
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"sort"
 	"strings"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -50,10 +52,67 @@ func (e *TargetNotHeldError) Error() string {
 // ReconcilePolicy ensures the correct tuples for a
 // PolicyBinding are present in the OpenFGA store.
 func (r *PolicyReconciler) ReconcilePolicy(ctx context.Context, binding iamdatumapiscomv1alpha1.PolicyBinding) error {
-	if err := r.reconcilePolicy(ctx, binding); err != nil {
-		return fmt.Errorf("reconciliation failed: %w", err)
+	_, err := r.ReconcilePolicyWithFingerprint(ctx, binding)
+	return err
+}
+
+// ReconcilePolicyWithFingerprint reconciles a binding and returns the
+// fingerprint of the exact desired tuple set used for that reconciliation.
+func (r *PolicyReconciler) ReconcilePolicyWithFingerprint(ctx context.Context, binding iamdatumapiscomv1alpha1.PolicyBinding) (string, error) {
+	fingerprint, err := r.reconcilePolicy(ctx, binding)
+	if err != nil {
+		return "", fmt.Errorf("reconciliation failed: %w", err)
 	}
-	return nil
+	return fingerprint, nil
+}
+
+// PolicyFingerprint returns a stable fingerprint of the tuples this binding
+// currently wants. It deliberately does not read OpenFGA, so callers can use
+// it to avoid the per-subject reads in ReconcilePolicy when the desired set has
+// already been programmed successfully.
+func (r *PolicyReconciler) PolicyFingerprint(ctx context.Context, binding iamdatumapiscomv1alpha1.PolicyBinding) (string, error) {
+	targetObject, err := r.getTargetObjectFromResourceSelector(binding.Spec.ResourceSelector)
+	if err != nil {
+		return "", fmt.Errorf("failed to get target object from resource selector: %w", err)
+	}
+
+	validPerms, err := r.getHierarchicalPermissionsForSelector(ctx, binding.Spec.ResourceSelector)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute hierarchical permissions: %w", err)
+	}
+
+	role, err := r.fetchRole(ctx, binding)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch role: %w", err)
+	}
+
+	desired, err := r.buildPermissionTuples(binding, role, targetObject, validPerms)
+	if err != nil {
+		return "", fmt.Errorf("failed to build permission tuples: %w", err)
+	}
+
+	return fingerprintTuples(r.StoreID, desired), nil
+}
+
+// fingerprintTuples hashes a tuple set rather than its construction order.
+// It includes the destination store so moving the controller to a new store
+// cannot reuse a fingerprint for tuples that have not been programmed there.
+// OpenFGA tuple fields cannot contain NUL, so NUL separators make the encoded
+// keys unambiguous without adding allocation-heavy protobuf serialization.
+func fingerprintTuples(storeID string, tuples []*openfgav1.TupleKey) string {
+	keys := make([]string, 0, len(tuples))
+	for _, tuple := range tuples {
+		keys = append(keys, tuple.GetUser()+"\x00"+tuple.GetRelation()+"\x00"+tuple.GetObject())
+	}
+	sort.Strings(keys)
+
+	h := sha256.New()
+	_, _ = h.Write([]byte("v1\x00" + storeID + "\x00"))
+	for _, key := range keys {
+		_, _ = h.Write([]byte(key))
+		_, _ = h.Write([]byte{0})
+	}
+	return fmt.Sprintf("v1:%x", h.Sum(nil))
 }
 
 // DeletePolicy removes only the tuples that are exclusively owned by this
@@ -125,35 +184,36 @@ func (r *PolicyReconciler) DeletePolicy(ctx context.Context, binding iamdatumapi
 // getExistingTuples reads all tuples for the binding's subjects on the target
 // object, so diffTuples will not re-write tuples that are already present,
 // regardless of which binding originally created them.
-func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatumapiscomv1alpha1.PolicyBinding) error {
+func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatumapiscomv1alpha1.PolicyBinding) (string, error) {
 	targetObject, err := r.getTargetObjectFromResourceSelector(binding.Spec.ResourceSelector)
 	if err != nil {
-		return fmt.Errorf("failed to get target object from resource selector: %w", err)
+		return "", fmt.Errorf("failed to get target object from resource selector: %w", err)
 	}
 
 	validPerms, err := r.getHierarchicalPermissionsForSelector(ctx, binding.Spec.ResourceSelector)
 	if err != nil {
-		return fmt.Errorf("failed to compute hierarchical permissions: %w", err)
+		return "", fmt.Errorf("failed to compute hierarchical permissions: %w", err)
 	}
 
 	role, err := r.fetchRole(ctx, binding)
 	if err != nil {
 		if r.EnableSubresourceAuthorization && apierrors.IsNotFound(err) {
 			if deleteErr := r.DeletePolicy(ctx, binding); deleteErr != nil {
-				return fmt.Errorf("failed to revoke missing role permissions: %w", deleteErr)
+				return "", fmt.Errorf("failed to revoke missing role permissions: %w", deleteErr)
 			}
 		}
-		return fmt.Errorf("failed to fetch role: %w", err)
+		return "", fmt.Errorf("failed to fetch role: %w", err)
 	}
 
 	desired, err := r.buildPermissionTuples(binding, role, targetObject, validPerms)
 	if err != nil {
-		return fmt.Errorf("failed to build permission tuples: %w", err)
+		return "", fmt.Errorf("failed to build permission tuples: %w", err)
 	}
+	fingerprint := fingerprintTuples(r.StoreID, desired)
 
 	existingTuples, err := r.getExistingTuples(ctx, binding, targetObject)
 	if err != nil {
-		return fmt.Errorf("failed to retrieve existing tuples: %w", err)
+		return "", fmt.Errorf("failed to retrieve existing tuples: %w", err)
 	}
 
 	added, removed := diffTuples(existingTuples, desired)
@@ -164,7 +224,7 @@ func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatum
 	if len(removed) > 0 {
 		siblingTuples, err := r.siblingDesiredTuples(ctx, binding, targetObject, validPerms)
 		if err != nil {
-			return fmt.Errorf("failed to compute sibling desired tuples: %w", err)
+			return "", fmt.Errorf("failed to compute sibling desired tuples: %w", err)
 		}
 		if len(siblingTuples) > 0 {
 			siblingSet := make(map[string]struct{}, len(siblingTuples))
@@ -203,10 +263,13 @@ func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatum
 	}
 
 	if writeReq.Deletes == nil && writeReq.Writes == nil {
-		return nil
+		return fingerprint, nil
 	}
 
-	return r.writeGuarded(ctx, writeReq, added)
+	if err := r.writeGuarded(ctx, writeReq, added); err != nil {
+		return "", err
+	}
+	return fingerprint, nil
 }
 
 // writeGuarded asks the guard before a write that adds tuples.
