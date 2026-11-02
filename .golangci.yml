@@ -30,6 +30,15 @@ linters:
       - linters:
           - dupl
         path: internal/*
+      - linters:
+          - staticcheck
+        text: 'SA1019: \(sigs\.k8s\.io/controller-runtime\.Result\)\.Requeue is deprecated'
+      - linters:
+          - goconst
+        path: _test\.go
+      - linters:
+          - goconst
+        text: 'string `(allowed|Ready)` has'
     paths:
       - third_party$
       - builtin$
