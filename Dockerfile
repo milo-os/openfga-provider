@@ -1,5 +1,5 @@
 # Build the auth-provider-openfga binary
-FROM docker.io/golang:1.26 AS builder
+FROM docker.io/golang:1.27 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
