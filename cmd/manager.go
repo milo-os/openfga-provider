@@ -271,20 +271,12 @@ func runManager(
 
 	// mcMgr is the primary manager. It owns leader election, metrics, and
 	// health probes. All multicluster controllers (ServiceAccount) register here.
-	mcMgr, err := mcmanager.New(upstreamClusterConfig, provider, ctrl.Options{
-		Scheme:                        scheme,
-		Metrics:                       metricsserver.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress:        probeAddr,
-		LeaderElection:                enableLeaderElection,
-		LeaderElectionID:              leaderElectionID,
-		LeaderElectionNamespace:       leaderElectionNamespace,
-		LeaderElectionResourceLock:    leaderElectionResourceLock,
-		LeaseDuration:                 &leaseDuration,
-		RenewDeadline:                 &renewDeadline,
-		RetryPeriod:                   &retryPeriod,
-		LeaderElectionConfig:          leaderElectionRestConfig(upstreamClusterConfig),
-		LeaderElectionReleaseOnCancel: true,
-	})
+	mcMgrOpts := electionOptions(upstreamClusterConfig, enableLeaderElection, leaderElectionID,
+		leaderElectionNamespace, leaderElectionResourceLock, leaseDuration, renewDeadline, retryPeriod)
+	mcMgrOpts.Scheme = scheme
+	mcMgrOpts.Metrics = metricsserver.Options{BindAddress: metricsAddr}
+	mcMgrOpts.HealthProbeBindAddress = probeAddr
+	mcMgr, err := mcmanager.New(upstreamClusterConfig, provider, mcMgrOpts)
 	if err != nil {
 		return fmt.Errorf("unable to start multicluster manager: %w", err)
 	}
@@ -574,6 +566,28 @@ func initializeClusterDiscovery(
 	}
 
 	return runnables, provider, nil
+}
+
+// electionOptions returns the primary manager's leader-election options: the
+// flags, a lease client of its own, and release on shutdown. The lease client
+// keeps renewals off the connection the rest of the API traffic uses, so a
+// stalled connection cannot cost the lease. Releasing is safe because
+// runUntilManagerStops ends the process only after the manager and every
+// worker have returned.
+func electionOptions(
+	cfg *rest.Config, enabled bool, id, namespace, lock string, lease, renew, retry time.Duration,
+) ctrl.Options {
+	return ctrl.Options{
+		LeaderElection:                enabled,
+		LeaderElectionID:              id,
+		LeaderElectionNamespace:       namespace,
+		LeaderElectionResourceLock:    lock,
+		LeaseDuration:                 &lease,
+		RenewDeadline:                 &renew,
+		RetryPeriod:                   &retry,
+		LeaderElectionConfig:          leaderElectionRestConfig(cfg),
+		LeaderElectionReleaseOnCancel: true,
+	}
 }
 
 const (
