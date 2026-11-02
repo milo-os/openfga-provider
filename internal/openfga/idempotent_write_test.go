@@ -23,6 +23,7 @@ type strictTupleStore struct {
 	openfgav1.OpenFGAServiceClient
 	tuples    map[string]*openfgav1.TupleKey
 	afterRead func(tuples map[string]*openfgav1.TupleKey)
+	writeErr  error
 }
 
 func tupleID(user, relation, object string) string { return user + "|" + relation + "|" + object }
@@ -42,6 +43,9 @@ func (s *strictTupleStore) Read(_ context.Context, in *openfgav1.ReadRequest, _ 
 }
 
 func (s *strictTupleStore) Write(_ context.Context, in *openfgav1.WriteRequest, _ ...grpc.CallOption) (*openfgav1.WriteResponse, error) {
+	if s.writeErr != nil {
+		return nil, s.writeErr
+	}
 	for _, t := range in.GetWrites().GetTupleKeys() {
 		if _, ok := s.tuples[tupleID(t.User, t.Relation, t.Object)]; ok && in.GetWrites().GetOnDuplicate() != "ignore" {
 			return nil, status.Error(codes.Code(2017), "cannot write a tuple which already exists")
@@ -93,18 +97,32 @@ func logViewerBinding(t *testing.T, store *strictTupleStore, perms ...string) (P
 	return PolicyReconciler{K8sClient: cli, Client: store}, binding, object
 }
 
-// TestReconcilePolicyAddsATupleAnotherBindingJustWrote checks that a binding's write succeeds when another binding,
-// which grants the same subject the same permission on the same object, wrote that tuple after this binding read.
-func TestReconcilePolicyAddsATupleAnotherBindingJustWrote(t *testing.T) {
-	user, list := TypeInternalUser+":alice", HashPermission("test.example/logs.list")
+// TestReconcilePolicyAddsSharedAndDistinctTuples checks that a binding's whole write succeeds when another binding
+// writes one shared tuple after the read, while a distinct tuple in the same batch is still added.
+func TestReconcilePolicyAddsSharedAndDistinctTuples(t *testing.T) {
+	user := TypeInternalUser + ":alice"
+	list, get := HashPermission("test.example/logs.list"), HashPermission("test.example/logs.get")
 	store := &strictTupleStore{tuples: map[string]*openfgav1.TupleKey{}}
-	reconciler, binding, object := logViewerBinding(t, store, "test.example/logs.list")
+	reconciler, binding, object := logViewerBinding(t, store, "test.example/logs.list", "test.example/logs.get")
 	store.afterRead = func(tuples map[string]*openfgav1.TupleKey) {
 		tuples[tupleID(user, list, object)] = &openfgav1.TupleKey{User: user, Relation: list, Object: object}
 	}
 
 	require.NoError(t, reconciler.ReconcilePolicy(context.Background(), binding))
 	require.Contains(t, store.tuples, tupleID(user, list, object))
+	require.Contains(t, store.tuples, tupleID(user, get, object))
+}
+
+func TestReconcilePolicyReturnsGenuineWriteFailure(t *testing.T) {
+	store := &strictTupleStore{
+		tuples:   map[string]*openfgav1.TupleKey{},
+		writeErr: status.Error(codes.Unavailable, "genuine write failure"),
+	}
+	reconciler, binding, _ := logViewerBinding(t, store, "test.example/logs.list")
+
+	err := reconciler.ReconcilePolicy(context.Background(), binding)
+	require.ErrorContains(t, err, "genuine write failure")
+	require.Empty(t, store.tuples)
 }
 
 // TestDeletePolicyRemovesATupleAnotherBindingJustRemoved checks that a deleted binding's clean-up succeeds when one of
