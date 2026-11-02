@@ -126,3 +126,28 @@ func TestLeaderElectionUsesItsOwnConnection(t *testing.T) {
 		t.Errorf("leader election reused the main client's connection %s", mainAddr)
 	}
 }
+
+func TestElectionOptionsReleaseOnCancelWithALeaseClientOfItsOwn(t *testing.T) {
+	base := &rest.Config{Host: "https://example.invalid"}
+	lease, renew, retry := 15*time.Second, 10*time.Second, 2*time.Second
+
+	opts := electionOptions(base, true, "4b85f171.miloapis.com", "milo-system", "leases", lease, renew, retry)
+
+	if !opts.LeaderElectionReleaseOnCancel {
+		t.Errorf("the manager keeps its lease on shutdown")
+	}
+	if opts.LeaderElectionConfig == nil || opts.LeaderElectionConfig == base || opts.LeaderElectionConfig.Dial == nil {
+		t.Errorf("the manager renews its lease without a client of its own")
+	}
+	type flags struct {
+		enabled             bool
+		id, namespace, lock string
+		lease, renew, retry time.Duration
+	}
+	got := flags{opts.LeaderElection, opts.LeaderElectionID, opts.LeaderElectionNamespace,
+		opts.LeaderElectionResourceLock, *opts.LeaseDuration, *opts.RenewDeadline, *opts.RetryPeriod}
+	want := flags{true, "4b85f171.miloapis.com", "milo-system", "leases", lease, renew, retry}
+	if got != want {
+		t.Errorf("the flags did not reach the options: got %+v, want %+v", got, want)
+	}
+}
