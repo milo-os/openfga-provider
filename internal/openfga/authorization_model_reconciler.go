@@ -239,27 +239,41 @@ func (r *AuthorizationModelReconciler) writeModelIDToConfigMap(ctx context.Conte
 }
 
 func (r *AuthorizationModelReconciler) getCurrentAuthorizationModel(ctx context.Context) (*openfgav1.AuthorizationModel, error) {
-	models, err := r.OpenFGA.ReadAuthorizationModels(ctx, &openfgav1.ReadAuthorizationModelsRequest{
-		StoreId:  r.StoreID,
+	model, err := latestAuthorizationModel(ctx, r.OpenFGA, r.StoreID)
+	if err != nil {
+		return nil, err
+	}
+	if model == nil {
+		return &openfgav1.AuthorizationModel{}, nil
+	}
+	return model, nil
+}
+
+// latestAuthorizationModel returns the store's newest authorization model, or nil when the store has none. OpenFGA
+// lists models newest first, so it lists a page of one: a full page is 50 models, and listing those can outlast the
+// server's request deadline.
+func latestAuthorizationModel(ctx context.Context, client openfgav1.OpenFGAServiceClient, storeID string) (*openfgav1.AuthorizationModel, error) {
+	models, err := client.ReadAuthorizationModels(ctx, &openfgav1.ReadAuthorizationModelsRequest{
+		StoreId:  storeID,
 		PageSize: wrapperspb.Int32(1),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list authorization models: %w", err)
 	}
 
-	if len(models.AuthorizationModels) == 0 {
-		return &openfgav1.AuthorizationModel{}, nil
+	if len(models.GetAuthorizationModels()) == 0 {
+		return nil, nil
 	}
 
-	resp, err := r.OpenFGA.ReadAuthorizationModel(ctx, &openfgav1.ReadAuthorizationModelRequest{
-		StoreId: r.StoreID,
-		Id:      models.AuthorizationModels[0].Id,
+	resp, err := client.ReadAuthorizationModel(ctx, &openfgav1.ReadAuthorizationModelRequest{
+		StoreId: storeID,
+		Id:      models.GetAuthorizationModels()[0].GetId(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get authorization model: %w", err)
 	}
 
-	return resp.AuthorizationModel, nil
+	return resp.GetAuthorizationModel(), nil
 }
 
 func (r *AuthorizationModelReconciler) createExpectedAuthorizationModel(protectedResources []iamdatumapiscomv1alpha1.ProtectedResource) (*openfgav1.AuthorizationModel, error) {

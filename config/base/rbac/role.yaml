@@ -50,10 +50,10 @@ rules:
   - iam.miloapis.com
   resources:
   - groupmemberships/finalizers
-  - machineaccounts/finalizers
   - policybindings/finalizers
   - protectedresources/finalizers
   - roles/finalizers
+  - serviceaccounts/finalizers
   - users/finalizers
   verbs:
   - update
@@ -71,8 +71,8 @@ rules:
 - apiGroups:
   - iam.miloapis.com
   resources:
-  - machineaccounts
   - protectedresources
+  - serviceaccounts
   - users
   verbs:
   - get

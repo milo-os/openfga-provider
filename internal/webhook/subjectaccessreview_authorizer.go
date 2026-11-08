@@ -823,3 +823,11 @@ func (o *SubjectAccessReviewAuthorizer) getProtectedResource(ctx context.Context
 	)
 	return nil, fmt.Errorf("no ProtectedResource found for APIGroup=%s, Resource=%s", apiGroup, resource)
 }
+
+func (o *SubjectAccessReviewAuthorizer) ConditionsAwareAuthorize(ctx context.Context, attrs authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(o.Authorize(ctx, attrs))
+}
+
+func (o *SubjectAccessReviewAuthorizer) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
+}

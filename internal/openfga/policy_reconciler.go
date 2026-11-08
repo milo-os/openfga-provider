@@ -105,6 +105,7 @@ func (r *PolicyReconciler) DeletePolicy(ctx context.Context, binding iamdatumapi
 		AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
 		Deletes: &openfgav1.WriteRequestDeletes{
 			TupleKeys: convertTuplesForDelete(toDelete),
+			OnMissing: onMissingIgnore,
 		},
 	}
 	if err := writeWithModelTransitionRetry(ctx, r.Client, writeRequest, r.ModelIDProvider); err != nil {
@@ -185,15 +186,19 @@ func (r *PolicyReconciler) reconcilePolicy(ctx context.Context, binding iamdatum
 		AuthorizationModelId: ModelIDFrom(r.ModelIDProvider),
 	}
 
+	// Two bindings that grant the same subject the same permission on the same object share its tuple. When both
+	// reconcile at once, each diff can include a tuple the other has just added or removed.
 	if len(added) > 0 {
 		writeReq.Writes = &openfgav1.WriteRequestWrites{
-			TupleKeys: added,
+			TupleKeys:   added,
+			OnDuplicate: onDuplicateIgnore,
 		}
 	}
 
 	if len(removed) > 0 {
 		writeReq.Deletes = &openfgav1.WriteRequestDeletes{
 			TupleKeys: convertTuplesForDelete(removed),
+			OnMissing: onMissingIgnore,
 		}
 	}
 

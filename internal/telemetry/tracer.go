@@ -6,6 +6,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -46,8 +47,13 @@ func SetupTracer(ctx context.Context, serviceName, serviceVersion, otlpEndpoint 
 		return nil, nil, fmt.Errorf("failed to create OTEL resource: %w", err)
 	}
 
+	endpointURL, err := tracesEndpointURL(otlpEndpoint)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	exporter, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithEndpointURL(otlpEndpoint),
+		otlptracehttp.WithEndpointURL(endpointURL),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create OTLP HTTP exporter: %w", err)
@@ -69,4 +75,15 @@ func SetupTracer(ctx context.Context, serviceName, serviceVersion, otlpEndpoint 
 	}
 
 	return tp, shutdown, nil
+}
+
+func tracesEndpointURL(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse OTLP endpoint %q: %w", endpoint, err)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return endpoint, nil
+	}
+	return url.JoinPath(endpoint, "/v1/traces")
 }

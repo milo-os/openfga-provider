@@ -7,7 +7,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 
 	mulicluster "go.miloapis.com/milo/pkg/multicluster-runtime"
 )
@@ -17,14 +16,18 @@ var (
 	GroupVersion = schema.GroupVersion{Group: "apiserver.config.miloapis.com", Version: "v1alpha1"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
-	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	SchemeBuilder = &runtime.SchemeBuilder{}
 
 	// AddToScheme adds the types in this group-version to the given scheme.
 	AddToScheme = SchemeBuilder.AddToScheme
 )
 
 func init() {
-	SchemeBuilder.Register(&AuthProviderOpenFGA{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &AuthProviderOpenFGA{})
+		metav1.AddToGroupVersion(s, GroupVersion)
+		return nil
+	})
 }
 
 type AuthProviderOpenFGA struct {
