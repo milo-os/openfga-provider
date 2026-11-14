@@ -62,8 +62,9 @@ func TestWriteWithModelTransitionRetryReadsOnlyTheNewestModel(t *testing.T) {
 	require.Equal(t, "model-new", modelID.GetModelID())
 }
 
-// TestMayBeModelTransition checks which failed writes the retry considers: additions only, pinned to a model ID, and
-// refused as an invalid tuple.
+// TestMayBeModelTransition checks which failed writes the retry considers: additions, pinned to a model ID, and
+// refused as an invalid tuple. Removals may share the same atomic request because OpenFGA validates only additions
+// against the authorization model.
 func TestMayBeModelTransition(t *testing.T) {
 	invalid := errors.New("Invalid tuple: relation not found in pinned model")
 	additions := &openfgav1.WriteRequestWrites{TupleKeys: []*openfgav1.TupleKey{{Relation: "r", Object: "t:o"}}}
@@ -77,7 +78,7 @@ func TestMayBeModelTransition(t *testing.T) {
 		{"pinned additions refused as invalid", &openfgav1.WriteRequest{AuthorizationModelId: "m", Writes: additions}, invalid, true},
 		{"no pinned model", &openfgav1.WriteRequest{Writes: additions}, invalid, false},
 		{"no additions", &openfgav1.WriteRequest{AuthorizationModelId: "m", Writes: &openfgav1.WriteRequestWrites{}}, invalid, false},
-		{"deletes as well", &openfgav1.WriteRequest{AuthorizationModelId: "m", Writes: additions, Deletes: deletes}, invalid, false},
+		{"additions and deletes", &openfgav1.WriteRequest{AuthorizationModelId: "m", Writes: additions, Deletes: deletes}, invalid, true},
 		{"another error", &openfgav1.WriteRequest{AuthorizationModelId: "m", Writes: additions}, errors.New("unavailable"), false},
 	}
 	for _, c := range cases {

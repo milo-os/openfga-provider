@@ -16,7 +16,9 @@ type modelIDUpdater interface {
 // writeWithModelTransitionRetry handles the short window where OpenFGA has
 // accepted a new model but a caller still has the previous model ID cached.
 // Retry only when the latest model explicitly defines every relation in the
-// requested additions. This keeps unknown permissions fail-closed.
+// requested additions. Deletes do not need model validation, so a mixed
+// add/remove request can remain atomic. This keeps unknown permissions
+// fail-closed.
 func writeWithModelTransitionRetry(
 	ctx context.Context,
 	client openfgav1.OpenFGAServiceClient,
@@ -62,7 +64,6 @@ func writeWithModelTransitionRetry(
 func mayBeModelTransition(request *openfgav1.WriteRequest, err error) bool {
 	return request.GetAuthorizationModelId() != "" &&
 		len(request.GetWrites().GetTupleKeys()) > 0 &&
-		request.GetDeletes() == nil &&
 		strings.Contains(err.Error(), "Invalid tuple")
 }
 
