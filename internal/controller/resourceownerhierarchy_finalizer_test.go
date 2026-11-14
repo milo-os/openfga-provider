@@ -42,8 +42,10 @@ const (
 // ignore it, and writing one that is stored fails it too.
 type fgaTupleStore struct {
 	openfgav1.OpenFGAServiceClient
-	mu     sync.Mutex
-	tuples []*openfgav1.TupleKey
+	mu      sync.Mutex
+	tuples  []*openfgav1.TupleKey
+	reads   int
+	readErr error
 	// added counts the writes that added tuples.
 	added int
 	// beforeWrite runs before a write that adds tuples is applied,
@@ -61,6 +63,10 @@ func (s *fgaTupleStore) Read(_ context.Context, in *openfgav1.ReadRequest, _ ...
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reads++
+	if s.readErr != nil {
+		return nil, s.readErr
+	}
 	var matched []*openfgav1.TupleKey
 	for _, t := range s.tuples {
 		if readKeyMatches(key, t) {
