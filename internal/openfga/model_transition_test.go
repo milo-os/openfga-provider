@@ -12,13 +12,15 @@ import (
 
 type transitionTestClient struct {
 	openfgav1.OpenFGAServiceClient
-	latestModel *openfgav1.AuthorizationModel
-	writeIDs    []string
-	writeErr    error
+	latestModel      *openfgav1.AuthorizationModel
+	writeIDs         []string
+	writeDeleteCount []int
+	writeErr         error
 }
 
 func (c *transitionTestClient) Write(_ context.Context, request *openfgav1.WriteRequest, _ ...grpc.CallOption) (*openfgav1.WriteResponse, error) {
 	c.writeIDs = append(c.writeIDs, request.GetAuthorizationModelId())
+	c.writeDeleteCount = append(c.writeDeleteCount, len(request.GetDeletes().GetTupleKeys()))
 	if c.writeErr != nil {
 		err := c.writeErr
 		c.writeErr = nil
@@ -67,6 +69,37 @@ func TestWriteWithModelTransitionRetryUsesLatestModelWhenItDefinesRelation(t *te
 	require.NoError(t, writeWithModelTransitionRetry(context.Background(), client, request, modelID))
 	require.Equal(t, []string{"model-old", "model-new"}, client.writeIDs)
 	require.Equal(t, "model-new", modelID.GetModelID())
+}
+
+func TestWriteWithModelTransitionRetryKeepsRemovalsAtomic(t *testing.T) {
+	client := &transitionTestClient{
+		latestModel: &openfgav1.AuthorizationModel{
+			Id: "model-new",
+			TypeDefinitions: []*openfgav1.TypeDefinition{{
+				Type:      "resourcemanager.miloapis.com/Organization",
+				Relations: map[string]*openfgav1.Userset{"new": {Userset: &openfgav1.Userset_This{}}},
+			}},
+		},
+		writeErr: errors.New("Invalid tuple: relation not found in pinned model"),
+	}
+	request := &openfgav1.WriteRequest{
+		StoreId:              "store",
+		AuthorizationModelId: "model-old",
+		Writes: &openfgav1.WriteRequestWrites{TupleKeys: []*openfgav1.TupleKey{{
+			User:     "iam.miloapis.com/InternalUser:user",
+			Relation: "new",
+			Object:   "resourcemanager.miloapis.com/Organization:org",
+		}}},
+		Deletes: &openfgav1.WriteRequestDeletes{TupleKeys: []*openfgav1.TupleKeyWithoutCondition{{
+			User:     "iam.miloapis.com/InternalUser:user",
+			Relation: "old",
+			Object:   "resourcemanager.miloapis.com/Organization:org",
+		}}},
+	}
+
+	require.NoError(t, writeWithModelTransitionRetry(context.Background(), client, request, &transitionTestModelID{id: "model-old"}))
+	require.Equal(t, []string{"model-old", "model-new"}, client.writeIDs)
+	require.Equal(t, []int{1, 1}, client.writeDeleteCount)
 }
 
 func TestWriteWithModelTransitionRetryDoesNotRetryUnknownRelation(t *testing.T) {
