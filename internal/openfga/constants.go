@@ -14,6 +14,10 @@ const (
 	RelationAssignee = "assignee"
 	RelationParent   = "parent"
 
+	SubjectKindUser           = "User"
+	SubjectKindGroup          = "Group"
+	SubjectKindServiceAccount = "ServiceAccount"
+
 	// OpenFGA metadata
 	SourceFile = "dynamically_managed_iam_datumapis_com.fga"
 	Module     = "iam.miloapis.com"

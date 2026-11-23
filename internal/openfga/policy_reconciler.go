@@ -282,6 +282,15 @@ func (r *PolicyReconciler) siblingDesiredTuples(
 			continue
 		}
 
+		mismatch, err := r.subjectMismatch(ctx, other)
+		if err != nil {
+			return nil, fmt.Errorf("failed to validate subjects of sibling binding %s/%s: %w", other.Namespace, other.Name, err)
+		}
+		if mismatch != "" {
+			r.markSiblingNotReady(ctx, other, mismatch)
+			continue
+		}
+
 		role, err := r.fetchRole(ctx, other)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -563,7 +572,7 @@ func getTupleKeys(ctx context.Context, storeID string, client openfgav1.OpenFGAS
 // token (consistent with how the auth webhook sets the SAR user UID).
 func getTupleUser(subject iamdatumapiscomv1alpha1.Subject) (string, error) {
 	switch subject.Kind {
-	case "User":
+	case SubjectKindUser:
 		if subject.UID == "" {
 			return "", fmt.Errorf("user subject must have a UID")
 		}
@@ -572,7 +581,7 @@ func getTupleUser(subject iamdatumapiscomv1alpha1.Subject) (string, error) {
 		// SubjectAccessReview requests (the system uses names as identity
 		// tokens, not the K8s metadata UID).
 		return TypeInternalUser + ":" + subject.Name, nil
-	case "ServiceAccount":
+	case SubjectKindServiceAccount:
 		if subject.UID == "" {
 			return "", fmt.Errorf("serviceaccount subject must have a UID")
 		}
@@ -581,7 +590,7 @@ func getTupleUser(subject iamdatumapiscomv1alpha1.Subject) (string, error) {
 		// token, which matches how the authentication webhook populates the
 		// SubjectAccessReview (using the resource's UID).
 		return TypeInternalUser + ":" + subject.UID, nil
-	case "Group":
+	case SubjectKindGroup:
 		// System groups (names starting with "system:") don't require UID and use the group name directly
 		if strings.HasPrefix(subject.Name, "system:") {
 			// Replace colons with underscores to avoid OpenFGA tuple parsing issues
