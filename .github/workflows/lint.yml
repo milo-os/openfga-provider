@@ -21,11 +21,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Read golangci-lint version
-        id: version
-        run: echo "version=$(cat .golangci-version)" >> $GITHUB_OUTPUT
-
       - name: Run linter
         uses: golangci/golangci-lint-action@v8
         with:
-          version: ${{ steps.version.outputs.version }}
+          version: v2.15.0
