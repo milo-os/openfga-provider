@@ -22,8 +22,9 @@ vars:
   # Tool versions
   KUSTOMIZE_VERSION: 'v5.6.0'
   CONTROLLER_TOOLS_VERSION: 'v0.17.2'
-  GOLANGCI_LINT_VERSION:
-    sh: test -f .golangci-version && cat .golangci-version || echo "v2.15"
+  # renovate: datasource=github-releases depName=golangci/golangci-lint
+  GOLANGCI_LINT_VERSION: 'v2.15.0'
+  # renovate: datasource=github-releases depName=kyverno/chainsaw
   CHAINSAW_VERSION: 'v0.2.15'
 
   # Kubernetes versions for testing
