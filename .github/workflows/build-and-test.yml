@@ -25,13 +25,15 @@ concurrency:
 jobs:
 
   check-files:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && vars.MILO_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
   validate-kustomize:
     uses: datum-cloud/actions/.github/workflows/validate-kustomize.yaml@v1.31.0
+    with:
+      runner: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && vars.MILO_LINUX_RUNNER || 'ubuntu-latest' }}
 
   publish-container-image:
     needs: validate-kustomize
